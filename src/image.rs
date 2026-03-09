@@ -482,18 +482,22 @@ impl Image {
                         source: e,
                     })?;
                     let mut tar_archive = Archive::new(decoder);
-                    tar_archive.unpack(&target_dir_clone).map_err(|e| Error::Io {
-                        message: format!("Failed to extract layer {}", layer_digest),
-                        source: e,
-                    })?;
+                    tar_archive
+                        .unpack(&target_dir_clone)
+                        .map_err(|e| Error::Io {
+                            message: format!("Failed to extract layer {}", layer_digest),
+                            source: e,
+                        })?;
                 } else {
                     // Default to gzip (covers tar+gzip and docker legacy media types)
                     let decoder = flate2::read::GzDecoder::new(cursor);
                     let mut tar_archive = Archive::new(decoder);
-                    tar_archive.unpack(&target_dir_clone).map_err(|e| Error::Io {
-                        message: format!("Failed to extract layer {}", layer_digest),
-                        source: e,
-                    })?;
+                    tar_archive
+                        .unpack(&target_dir_clone)
+                        .map_err(|e| Error::Io {
+                            message: format!("Failed to extract layer {}", layer_digest),
+                            source: e,
+                        })?;
                 }
 
                 debug!(layer_digest = %layer_digest, "Layer extracted successfully");

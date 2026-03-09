@@ -291,10 +291,17 @@ impl Image {
             .from(image_ref)
             .pull_policy(options.pull_policy);
 
-        if let Some(os) = options.platform_os {
-            if let Some(arch) = options.platform_arch {
+        match (options.platform_os, options.platform_arch) {
+            (Some(os), Some(arch)) => {
                 builder = builder.platform(&os, &arch);
             }
+            (Some(_), None) => {
+                warn!("platform_os set without platform_arch; platform filter will not be applied");
+            }
+            (None, Some(_)) => {
+                warn!("platform_arch set without platform_os; platform filter will not be applied");
+            }
+            (None, None) => {}
         }
 
         if let Some(cache) = options.blob_cache {
@@ -489,9 +496,7 @@ impl Image {
                     Archive::new(decoder)
                         .unpack(&target_dir_clone)
                         .map_err(unpack_err)?;
-                } else if media_type.contains("+gzip")
-                    || media_type.contains("vnd.docker.image.rootfs")
-                {
+                } else if media_type.contains("+gzip") || media_type.contains("gzip") {
                     let decoder = flate2::read::GzDecoder::new(cursor);
                     Archive::new(decoder)
                         .unpack(&target_dir_clone)
@@ -1328,7 +1333,7 @@ impl ImageBuilder {
                 // Per Docker/OCI convention, setting entrypoint resets cmd
                 // unless the user also explicitly set cmd
                 if self.cmd.is_none() {
-                    proc_config.set_cmd(Some(vec![]));
+                    proc_config.set_cmd(None);
                 }
             }
             if let Some(cmd) = self.cmd {

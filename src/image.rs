@@ -473,6 +473,11 @@ impl Image {
                 let cursor = Cursor::new(layer_data_vec);
 
                 // Decompress based on media type
+                let unpack_err = |e| Error::Io {
+                    message: format!("Failed to extract layer {}", layer_digest),
+                    source: e,
+                };
+
                 if media_type.contains("+zstd") {
                     let decoder = zstd::Decoder::new(cursor).map_err(|e| Error::Io {
                         message: format!(
@@ -481,23 +486,21 @@ impl Image {
                         ),
                         source: e,
                     })?;
-                    let mut tar_archive = Archive::new(decoder);
-                    tar_archive
+                    Archive::new(decoder)
                         .unpack(&target_dir_clone)
-                        .map_err(|e| Error::Io {
-                            message: format!("Failed to extract layer {}", layer_digest),
-                            source: e,
-                        })?;
-                } else {
-                    // Default to gzip (covers tar+gzip and docker legacy media types)
+                        .map_err(unpack_err)?;
+                } else if media_type.contains("+gzip")
+                    || media_type.contains("vnd.docker.image.rootfs")
+                {
                     let decoder = flate2::read::GzDecoder::new(cursor);
-                    let mut tar_archive = Archive::new(decoder);
-                    tar_archive
+                    Archive::new(decoder)
                         .unpack(&target_dir_clone)
-                        .map_err(|e| Error::Io {
-                            message: format!("Failed to extract layer {}", layer_digest),
-                            source: e,
-                        })?;
+                        .map_err(unpack_err)?;
+                } else {
+                    // Uncompressed tar
+                    Archive::new(cursor)
+                        .unpack(&target_dir_clone)
+                        .map_err(unpack_err)?;
                 }
 
                 debug!(layer_digest = %layer_digest, "Layer extracted successfully");
@@ -778,9 +781,7 @@ impl Image {
         info!("Pushing image (layers, config, manifest).");
 
         // Report that we're about to start the actual upload
-        let operation_text = if layers_to_push.is_empty() {
-            "All layers cached".to_string()
-        } else if total_push_size_bytes > 10 * 1024 * 1024 {
+        let operation_text = if total_push_size_bytes > 10 * 1024 * 1024 {
             format!(
                 "Uploading {:.1} MB in {} layers",
                 total_push_size_bytes as f64 / (1024.0 * 1024.0),
@@ -1324,11 +1325,14 @@ impl ImageBuilder {
             let mut proc_config = config.config().clone().unwrap_or_default();
             if let Some(entrypoint) = self.entrypoint {
                 proc_config.set_entrypoint(Some(entrypoint));
+                // Per Docker/OCI convention, setting entrypoint resets cmd
+                // unless the user also explicitly set cmd
+                if self.cmd.is_none() {
+                    proc_config.set_cmd(Some(vec![]));
+                }
             }
             if let Some(cmd) = self.cmd {
                 proc_config.set_cmd(Some(cmd));
-            } else {
-                proc_config.set_cmd(Some(vec![]));
             }
             if let Some(working_dir) = self.working_dir {
                 proc_config.set_working_dir(Some(working_dir));
@@ -1362,8 +1366,6 @@ impl ImageBuilder {
             }
             if let Some(cmd) = self.cmd {
                 config_builder = config_builder.cmd(cmd);
-            } else {
-                config_builder = config_builder.cmd(Vec::<String>::new());
             }
             if let Some(working_dir) = self.working_dir {
                 config_builder = config_builder.working_dir(working_dir);

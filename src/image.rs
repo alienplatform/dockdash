@@ -463,42 +463,38 @@ impl Image {
             let layer_data_vec = layer_data.to_vec();
             let target_dir_clone = target_dir.to_path_buf();
             let layer_digest = desc.digest().to_string();
+            let media_type = desc.media_type().to_string();
 
             // Extract in a blocking task since tar extraction is CPU-intensive
             tokio::task::spawn_blocking(move || -> Result<()> {
                 use std::io::Cursor;
                 use tar::Archive;
 
-                // Decompress zstd
                 let cursor = Cursor::new(layer_data_vec);
-                let decoder = zstd::Decoder::new(cursor).map_err(|e| {
-                    warn!(
-                        layer_digest = %layer_digest,
-                        error = %e,
-                        "Failed to create zstd decoder"
-                    );
-                    Error::Io {
+
+                // Decompress based on media type
+                if media_type.contains("+zstd") {
+                    let decoder = zstd::Decoder::new(cursor).map_err(|e| Error::Io {
                         message: format!(
                             "Failed to create zstd decoder for layer {}",
                             layer_digest
                         ),
                         source: e,
-                    }
-                })?;
-
-                // Extract tar
-                let mut tar_archive = Archive::new(decoder);
-                tar_archive.unpack(&target_dir_clone).map_err(|e| {
-                    warn!(
-                        layer_digest = %layer_digest,
-                        error = %e,
-                        "Failed to extract tar archive"
-                    );
-                    Error::Io {
+                    })?;
+                    let mut tar_archive = Archive::new(decoder);
+                    tar_archive.unpack(&target_dir_clone).map_err(|e| Error::Io {
                         message: format!("Failed to extract layer {}", layer_digest),
                         source: e,
-                    }
-                })?;
+                    })?;
+                } else {
+                    // Default to gzip (covers tar+gzip and docker legacy media types)
+                    let decoder = flate2::read::GzDecoder::new(cursor);
+                    let mut tar_archive = Archive::new(decoder);
+                    tar_archive.unpack(&target_dir_clone).map_err(|e| Error::Io {
+                        message: format!("Failed to extract layer {}", layer_digest),
+                        source: e,
+                    })?;
+                }
 
                 debug!(layer_digest = %layer_digest, "Layer extracted successfully");
                 Ok(())
@@ -1548,7 +1544,4 @@ fn is_registry_requiring_monolithic_push(registry_host: &str) -> bool {
     registry_host.ends_with("-docker.pkg.dev") // Google Artifact Registry
         || registry_host == "gcr.io"
         || registry_host.ends_with(".gcr.io") // Google Container Registry
-        || registry_host == "us.gcr.io"
-        || registry_host == "eu.gcr.io"
-        || registry_host == "asia.gcr.io"
 }

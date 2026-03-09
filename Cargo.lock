@@ -613,6 +613,7 @@ dependencies = [
  "container-registry",
  "dirs",
  "dotenvy",
+ "flate2",
  "futures-util",
  "oci-client",
  "oci-spec 0.6.8",

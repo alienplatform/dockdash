@@ -214,13 +214,58 @@ impl LayerBuilder {
                 }
             })?;
 
-        self.file_metadata.push(FileMetadata {
-            archive_path: normalized_ap,
-            size: 0,
-            mtime: 0,
-            mode: 0o755,
-            is_dir: true,
-        });
+        // Walk the source directory and record metadata for every file,
+        // so the input-based cache key captures actual directory contents.
+        for entry in walkdir::WalkDir::new(dp_ref).sort_by_file_name() {
+            let entry = entry.map_err(|e| Error::Io {
+                source: e.into(),
+                message: format!(
+                    "Failed to walk directory {} for cache key metadata",
+                    dp_ref.display()
+                ),
+            })?;
+            let entry_metadata = entry.metadata().map_err(|e| Error::Io {
+                source: e.into(),
+                message: format!(
+                    "Failed to get metadata for {}",
+                    entry.path().display()
+                ),
+            })?;
+            let relative = entry
+                .path()
+                .strip_prefix(dp_ref)
+                .unwrap_or(entry.path());
+            let archive_entry_path = normalized_ap.join(relative);
+
+            let mtime = entry_metadata
+                .modified()
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                })
+                .unwrap_or(0);
+
+            let mode = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    entry_metadata.permissions().mode()
+                }
+                #[cfg(not(unix))]
+                {
+                    if entry_metadata.is_dir() { 0o755 } else { 0o644 }
+                }
+            };
+
+            self.file_metadata.push(FileMetadata {
+                archive_path: archive_entry_path,
+                size: entry_metadata.len(),
+                mtime,
+                mode,
+                is_dir: entry_metadata.is_dir(),
+            });
+        }
 
         debug!("Successfully added directory to layer.");
         Ok(self)
@@ -466,7 +511,6 @@ impl LayerBuilder {
         }
 
         // Input-based cache miss - finalize the tar and try content-based cache
-        eprintln!("[DEBUG] INPUT CACHE MISS for input_key={}", input_key);
         debug!("Input-based cache miss, finalizing tar");
 
         // Finalize the tar writer, ensuring all data is flushed and the file is closed.

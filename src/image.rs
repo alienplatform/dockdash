@@ -683,17 +683,23 @@ impl Image {
             let digest_str = desc.digest().to_string();
             let mut should_skip_upload = false;
 
-            debug!(layer_digest = %digest_str, "Attempting to mount layer.");
+            // oci-client does not expose a HEAD /v2/<name>/blobs/<digest> API,
+            // so we use a self-mount (same source and destination repo) as a blob
+            // existence check. Per the OCI Distribution Spec, registries that
+            // support cross-repo mount will return 201 if the blob already exists
+            // in the target repo. If the registry rejects the self-mount, we fall
+            // through to the upload path.
+            debug!(layer_digest = %digest_str, "Checking if layer already exists via self-mount.");
             match oci_client
                 .mount_blob(&push_ref, &push_ref, &digest_str)
                 .await
             {
                 Ok(_) => {
-                    info!(layer_digest = %digest_str, "Layer successfully mounted (OCI 201).");
+                    info!(layer_digest = %digest_str, "Layer already exists in registry (mount returned 201).");
                     should_skip_upload = true;
                 }
                 Err(e) => {
-                    debug!(layer_digest = %digest_str, error = %e, "Layer mount failed. Will upload.");
+                    debug!(layer_digest = %digest_str, error = %e, "Self-mount failed, layer will be uploaded.");
                 }
             }
 
@@ -1494,27 +1500,42 @@ impl ImageBuilder {
 }
 
 /// Determines the RegistryAuth by trying environment variables and falling back to Anonymous.
+///
+/// The `DOCKER_USERNAME`/`DOCKER_PASSWORD` env vars are only applied when the target
+/// registry is Docker Hub (`index.docker.io` / `registry-1.docker.io`). For all other
+/// registries, anonymous auth is used unless credentials are provided via the
+/// `PushOptions::auth` field.
 fn determine_registry_auth(reference: &Reference) -> RegistryAuth {
-    let host_for_logging = reference.resolve_registry(); // Still useful for logging
+    let registry_host = reference.resolve_registry();
 
-    let auth = match (env::var("DOCKER_USERNAME"), env::var("DOCKER_PASSWORD")) {
+    let is_docker_hub = registry_host == "index.docker.io"
+        || registry_host == "registry-1.docker.io"
+        || registry_host == "docker.io";
+
+    if !is_docker_hub {
+        info!(
+            "Registry {} is not Docker Hub. Using anonymous auth (provide explicit auth via PushOptions for authenticated access).",
+            registry_host
+        );
+        return RegistryAuth::Anonymous;
+    }
+
+    match (env::var("DOCKER_USERNAME"), env::var("DOCKER_PASSWORD")) {
         (Ok(username), Ok(password)) if !username.is_empty() && !password.is_empty() => {
             info!(
                 "Using Docker credentials from DOCKER_USERNAME/PASSWORD env vars for {}",
-                host_for_logging
+                registry_host
             );
             RegistryAuth::Basic(username, password)
         }
         _ => {
             info!(
                 "DOCKER_USERNAME and/or DOCKER_PASSWORD not set or empty. Falling back to anonymous auth for {}.",
-                host_for_logging
+                registry_host
             );
             RegistryAuth::Anonymous
         }
-    };
-
-    auth
+    }
 }
 
 /// Determines whether to use monolithic push based on the policy and registry hostname.

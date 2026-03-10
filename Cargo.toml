@@ -29,6 +29,7 @@ container-registry = { version = "0.3", features = ["test-support"], optional = 
 async-trait = "0.1"
 zstd = "0.13"
 flate2 = "1"
+walkdir = "2"
 
 [dev-dependencies]
 bollard = "0.18"

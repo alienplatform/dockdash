@@ -1614,10 +1614,15 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
                     .unwrap_or_else(|| Path::new(""))
                     .join(target_name),
             );
-            if target_path.is_dir() {
-                let _ = std_fs::remove_dir_all(&target_path);
+            let remove_result = if target_path.is_dir() {
+                std_fs::remove_dir_all(&target_path)
             } else {
-                let _ = std_fs::remove_file(&target_path);
+                std_fs::remove_file(&target_path)
+            };
+            if let Err(e) = remove_result {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(e);
+                }
             }
         } else {
             // Normal entry — extract it

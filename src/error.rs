@@ -65,7 +65,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
         Error::Io {
-            message: err.to_string(),
+            message: "An I/O error occurred".to_string(),
             source: err,
         }
     }

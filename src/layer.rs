@@ -11,8 +11,7 @@ use tempfile::NamedTempFile;
 use tokio::task;
 use tracing::{debug, info, instrument, warn};
 
-/// OCI media type for zstd-compressed tar layers
-const IMAGE_LAYER_ZSTD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+use crate::IMAGE_LAYER_ZSTD_MEDIA_TYPE;
 
 /// Represents a single layer in an OCI image.
 ///

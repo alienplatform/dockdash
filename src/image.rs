@@ -14,8 +14,7 @@ use oci_client::{
     Reference, RegistryOperation,
 };
 
-/// OCI media type for zstd-compressed tar layers
-const IMAGE_LAYER_ZSTD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+use crate::IMAGE_LAYER_ZSTD_MEDIA_TYPE;
 use oci_spec::image::Arch;
 use oci_spec::image::{ImageConfiguration, ImageManifest as SpecImageManifest};
 use ocipkg::image::Image as _;
@@ -479,8 +478,8 @@ impl Image {
 
                 let cursor = Cursor::new(layer_data_vec);
 
-                // Decompress based on media type
-                let unpack_err = |e| Error::Io {
+                // Create the appropriate archive reader based on media type
+                let extract_err = |e: std::io::Error| Error::Io {
                     message: format!("Failed to extract layer {}", layer_digest),
                     source: e,
                 };
@@ -493,19 +492,16 @@ impl Image {
                         ),
                         source: e,
                     })?;
-                    Archive::new(decoder)
-                        .unpack(&target_dir_clone)
-                        .map_err(unpack_err)?;
+                    extract_layer_with_whiteouts(Archive::new(decoder), &target_dir_clone)
+                        .map_err(extract_err)?;
                 } else if media_type.contains("+gzip") || media_type.contains("gzip") {
                     let decoder = flate2::read::GzDecoder::new(cursor);
-                    Archive::new(decoder)
-                        .unpack(&target_dir_clone)
-                        .map_err(unpack_err)?;
+                    extract_layer_with_whiteouts(Archive::new(decoder), &target_dir_clone)
+                        .map_err(extract_err)?;
                 } else {
                     // Uncompressed tar
-                    Archive::new(cursor)
-                        .unpack(&target_dir_clone)
-                        .map_err(unpack_err)?;
+                    extract_layer_with_whiteouts(Archive::new(cursor), &target_dir_clone)
+                        .map_err(extract_err)?;
                 }
 
                 debug!(layer_digest = %layer_digest, "Layer extracted successfully");
@@ -1568,6 +1564,67 @@ fn determine_use_monolithic_push(policy: &MonolithicPushPolicy, reference: &Refe
             use_monolithic
         }
     }
+}
+
+/// Extracts a tar archive layer while handling OCI/Docker whiteout files.
+///
+/// Whiteout files signal deletions from prior layers:
+/// - `.wh.<name>` in a directory means `<name>` should be deleted
+/// - `.wh..wh..opq` means the containing directory is opaque (all prior contents deleted)
+fn extract_layer_with_whiteouts<R: std::io::Read>(
+    mut archive: tar::Archive<R>,
+    target_dir: &Path,
+) -> std::io::Result<()> {
+    for entry_result in archive.entries()? {
+        let mut entry = entry_result?;
+        let entry_path = entry.path()?.into_owned();
+
+        let file_name = match entry_path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => {
+                // No file name (e.g., root entry) — just unpack normally
+                entry.unpack_in(target_dir)?;
+                continue;
+            }
+        };
+
+        if file_name == ".wh..wh..opq" {
+            // Opaque whiteout: delete all existing contents in the parent directory
+            let parent = target_dir.join(
+                entry_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("")),
+            );
+            if parent.is_dir() {
+                for child in std_fs::read_dir(&parent)? {
+                    let child = child?;
+                    let child_path = child.path();
+                    if child_path.is_dir() {
+                        std_fs::remove_dir_all(&child_path)?;
+                    } else {
+                        std_fs::remove_file(&child_path)?;
+                    }
+                }
+            }
+        } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
+            // Regular whiteout: delete the specific file/directory
+            let target_path = target_dir.join(
+                entry_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .join(target_name),
+            );
+            if target_path.is_dir() {
+                let _ = std_fs::remove_dir_all(&target_path);
+            } else {
+                let _ = std_fs::remove_file(&target_path);
+            }
+        } else {
+            // Normal entry — extract it
+            entry.unpack_in(target_dir)?;
+        }
+    }
+    Ok(())
 }
 
 /// Checks if a registry requires monolithic push based on its hostname.

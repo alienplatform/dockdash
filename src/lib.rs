@@ -32,6 +32,9 @@
 //! # }
 //! ```
 
+/// OCI media type for zstd-compressed tar layers
+pub(crate) const IMAGE_LAYER_ZSTD_MEDIA_TYPE: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
+
 mod error;
 pub use error::*;
 

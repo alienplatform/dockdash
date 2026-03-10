@@ -1630,8 +1630,14 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
                 }
             }
         } else {
-            // Normal entry — extract it
-            entry.unpack_in(target_dir)?;
+            // Normal entry — extract it. unpack_in returns false if the
+            // path would escape target_dir (path traversal guard).
+            if !entry.unpack_in(target_dir)? {
+                warn!(
+                    path = %entry_path.display(),
+                    "Skipping tar entry: path escapes target directory"
+                );
+            }
         }
     }
     Ok(())

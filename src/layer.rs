@@ -65,6 +65,8 @@ struct FileMetadata {
     mode: u32,
     /// Whether this is a directory
     is_dir: bool,
+    /// Optional content hash for in-memory data (where mtime is meaningless)
+    content_hash: Option<[u8; 32]>,
 }
 
 /// Builder for creating `Layer` instances.
@@ -141,12 +143,15 @@ impl LayerBuilder {
         sorted_metadata.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
 
         for meta in &sorted_metadata {
-            // Hash: path | size | mtime | mode | is_dir
+            // Hash: path | size | mtime | mode | is_dir | content_hash
             hasher.update(meta.archive_path.to_string_lossy().as_bytes());
             hasher.update(meta.size.to_le_bytes());
             hasher.update(meta.mtime.to_le_bytes());
             hasher.update(meta.mode.to_le_bytes());
             hasher.update([meta.is_dir as u8]);
+            if let Some(ref hash) = meta.content_hash {
+                hasher.update(hash);
+            }
         }
 
         format!("layer-input-{:x}", hasher.finalize())
@@ -263,6 +268,7 @@ impl LayerBuilder {
                 mtime,
                 mode,
                 is_dir: entry_metadata.is_dir(),
+                content_hash: None,
             });
         }
 
@@ -346,6 +352,7 @@ impl LayerBuilder {
                 .unwrap_or(0),
             mode: file_mode,
             is_dir: false,
+            content_hash: None,
         });
 
         if let Some(new_mode) = mode {
@@ -437,12 +444,20 @@ impl LayerBuilder {
                 }
             })?;
 
+        // Hash in-memory content so the input cache key distinguishes
+        // different data at the same path/size (mtime is always 0 here).
+        let content_hash: [u8; 32] = {
+            use sha2::Digest;
+            Sha256::digest(content).into()
+        };
+
         self.file_metadata.push(FileMetadata {
             archive_path: normalized_ap,
             size: content.len() as u64,
             mtime: 0,
             mode: mode.unwrap_or(0o644),
             is_dir: false,
+            content_hash: Some(content_hash),
         });
 
         debug!("Successfully added data to layer.");

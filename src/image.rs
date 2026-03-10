@@ -1096,7 +1096,12 @@ impl ImageBuilder {
                 }
             };
 
-            let manifest_cache_key = format!("manifest-v1:{}", base_ref.whole());
+            let manifest_cache_key = format!(
+                "manifest-v2:{}:{}:{}",
+                base_ref.whole(),
+                target_os_for_build.as_str(),
+                target_arch_for_build,
+            );
             let manifest_source_temp: ManifestSource;
 
             let (base_image_manifest_resolved, resolved_manifest_digest_str_temp) = if pull_policy

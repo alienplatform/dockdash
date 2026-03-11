@@ -230,15 +230,9 @@ impl LayerBuilder {
             })?;
             let entry_metadata = entry.metadata().map_err(|e| Error::Io {
                 source: e.into(),
-                message: format!(
-                    "Failed to get metadata for {}",
-                    entry.path().display()
-                ),
+                message: format!("Failed to get metadata for {}", entry.path().display()),
             })?;
-            let relative = entry
-                .path()
-                .strip_prefix(dp_ref)
-                .unwrap_or(entry.path());
+            let relative = entry.path().strip_prefix(dp_ref).unwrap_or(entry.path());
             let archive_entry_path = normalized_ap.join(relative);
 
             let mtime = entry_metadata
@@ -258,7 +252,11 @@ impl LayerBuilder {
                 }
                 #[cfg(not(unix))]
                 {
-                    if entry_metadata.is_dir() { 0o755 } else { 0o644 }
+                    if entry_metadata.is_dir() {
+                        0o755
+                    } else {
+                        0o644
+                    }
                 }
             };
 

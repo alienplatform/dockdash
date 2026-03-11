@@ -62,15 +62,6 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl From<std::io::Error> for Error {
-    fn from(err: std::io::Error) -> Self {
-        Error::Io {
-            message: "An I/O error occurred".to_string(),
-            source: err,
-        }
-    }
-}
-
 impl Error {
     /// Checks if this error is due to a manifest not being found in the registry.
     /// This is used to determine if we should retry with a fallback base image.

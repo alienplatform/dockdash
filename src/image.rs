@@ -1502,24 +1502,10 @@ impl ImageBuilder {
 
 /// Determines the RegistryAuth by trying environment variables and falling back to Anonymous.
 ///
-/// The `DOCKER_USERNAME`/`DOCKER_PASSWORD` env vars are only applied when the target
-/// registry is Docker Hub (`index.docker.io` / `registry-1.docker.io`). For all other
-/// registries, anonymous auth is used unless credentials are provided via the
-/// `PushOptions::auth` field.
+/// Note: `DOCKER_USERNAME`/`DOCKER_PASSWORD` env vars are applied to all registries.
+/// For per-registry auth control, use the `auth` field on `PushOptions` or `ImageBuilder`.
 fn determine_registry_auth(reference: &Reference) -> RegistryAuth {
     let registry_host = reference.resolve_registry();
-
-    let is_docker_hub = registry_host == "index.docker.io"
-        || registry_host == "registry-1.docker.io"
-        || registry_host == "docker.io";
-
-    if !is_docker_hub {
-        info!(
-            "Registry {} is not Docker Hub. Using anonymous auth (provide explicit auth via PushOptions for authenticated access).",
-            registry_host
-        );
-        return RegistryAuth::Anonymous;
-    }
 
     match (env::var("DOCKER_USERNAME"), env::var("DOCKER_PASSWORD")) {
         (Ok(username), Ok(password)) if !username.is_empty() && !password.is_empty() => {
@@ -1595,11 +1581,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let parent = target_dir.join(
-                entry_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("")),
-            );
+            let parent = target_dir.join(entry_path.parent().unwrap_or_else(|| Path::new("")));
             if parent.is_dir() {
                 for child in std_fs::read_dir(&parent)? {
                     let child = child?;

@@ -762,7 +762,8 @@ impl LayerBuilder {
             let mut current_ancestor = parent;
             // Collect all ancestor paths up to the root
             loop {
-                if !current_ancestor.as_os_str().is_empty() {
+                let s = current_ancestor.to_string_lossy();
+                if !s.is_empty() && s != "/" {
                     paths_to_create.push(current_ancestor.to_path_buf());
                 }
                 if let Some(p) = current_ancestor.parent() {
@@ -819,6 +820,10 @@ impl LayerBuilder {
 // Converts absolute paths like "/foo/bar" to relative "foo/bar".
 // A path like "/" becomes an empty path, suitable for archive root in some tar operations.
 fn normalize_archive_path(path_in_layer: &Path) -> PathBuf {
+    // On Windows, Path::is_absolute() requires a drive letter (e.g. C:\), so
+    // Unix-style absolute paths like "/app/foo" are not detected as absolute.
+    // We handle both cases: platform-native absolute paths via .components().skip(1),
+    // and Unix-style leading '/' via byte/string stripping.
     if path_in_layer.is_absolute() {
         // .components() -> RootDir, "foo", "bar"
         // .skip(1) -> "foo", "bar"
@@ -826,7 +831,12 @@ fn normalize_archive_path(path_in_layer: &Path) -> PathBuf {
         // If path_in_layer is just "/", components().skip(1) is empty, collect() -> ""
         path_in_layer.components().skip(1).collect::<PathBuf>()
     } else {
-        path_in_layer.to_path_buf()
+        let path_str = path_in_layer.to_string_lossy();
+        if path_str.starts_with('/') {
+            PathBuf::from(path_str.trim_start_matches('/'))
+        } else {
+            path_in_layer.to_path_buf()
+        }
     }
 }
 

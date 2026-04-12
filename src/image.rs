@@ -202,6 +202,8 @@ pub struct PullAndExtractOptions {
     pub blob_cache: Option<blobcache::BlobCache>,
     /// Optional authentication for the registry
     pub auth: Option<RegistryAuth>,
+    /// Protocol to use (Http or Https). Defaults to Https.
+    pub protocol: ClientProtocol,
 }
 
 /// Represents a built OCI image stored as an OCI layout tarball.
@@ -219,7 +221,21 @@ pub struct Image {
 impl Image {
     /// Returns a builder to construct an `Image`.
     pub fn builder() -> ImageBuilder {
-        ImageBuilder::default()
+        ImageBuilder {
+            base_image_ref: None,
+            platform_os: None,
+            platform_arch: None,
+            layers: Vec::new(),
+            entrypoint: None,
+            cmd: None,
+            working_dir: None,
+            output_path: None,
+            blob_cache: None,
+            output_image_name_and_tag: None,
+            pull_policy: None,
+            auth: None,
+            protocol: ClientProtocol::Https,
+        }
     }
 
     /// Loads an existing OCI tarball from disk.
@@ -288,7 +304,8 @@ impl Image {
         // Build the image (pulls from registry, uses cache)
         let mut builder = Image::builder()
             .from(image_ref)
-            .pull_policy(options.pull_policy);
+            .pull_policy(options.pull_policy)
+            .protocol(options.protocol);
 
         match (options.platform_os, options.platform_arch) {
             (Some(os), Some(arch)) => {
@@ -919,6 +936,7 @@ pub struct ImageBuilder {
     output_image_name_and_tag: Option<String>,
     pull_policy: Option<PullPolicy>,
     auth: Option<RegistryAuth>,
+    protocol: ClientProtocol,
 }
 
 impl ImageBuilder {
@@ -989,6 +1007,12 @@ impl ImageBuilder {
 
     /// Sets the authentication for pulling the base image.
     /// If not set, authentication is determined from environment variables (DOCKER_USERNAME/DOCKER_PASSWORD).
+    /// Sets the protocol (Http or Https) for registry communication.
+    pub fn protocol(mut self, protocol: ClientProtocol) -> Self {
+        self.protocol = protocol;
+        self
+    }
+
     pub fn auth(mut self, auth: RegistryAuth) -> Self {
         self.auth = Some(auth);
         self
@@ -1051,7 +1075,10 @@ impl ImageBuilder {
                 }
             };
 
-            let mut client_cfg = ClientConfig::default();
+            let mut client_cfg = ClientConfig {
+                protocol: self.protocol.clone(),
+                ..Default::default()
+            };
 
             if let (Some(os_filter_val), Some(arch_filter_val)) =
                 (&self.platform_os, &self.platform_arch)

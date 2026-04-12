@@ -1,6 +1,6 @@
 [package]
 name = "dockdash"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Alien <hello@alien.dev>"]
 description = "Build and push OCI container images without Docker"

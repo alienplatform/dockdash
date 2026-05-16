@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">dockdash</h1>
   <p align="center">
-    Build and push OCI container images from Rust — no Docker daemon required.
+    Build and push Docker images from Rust 🦀 — without Docker installed.
   </p>
 </p>
 
@@ -14,17 +14,19 @@
 
 ---
 
-**Dockdash** is a Rust library for building and pushing OCI-compliant container images — without needing Docker installed. It's fast, lightweight, and works anywhere Rust runs: CI pipelines, serverless functions, CLIs, or embedded tooling.
+**Dockdash** is a Rust library for building and pushing Docker (OCI) images — no Docker daemon, no `docker` CLI, no privileged containers. Just a normal Rust crate that produces real container images and ships them to any registry.
+
+It's fast enough to run inside a serverless function: build an image in a Lambda, push it to ECR, and exit before your cold start budget runs out.
 
 ## Why Dockdash?
 
-- **No Docker daemon** — build images in environments where Docker isn't available (serverless, sandboxed CI, etc.)
-- **Fast** — native Rust performance with zstd layer compression and content-addressable blob caching
-- **Simple API** — intuitive builder pattern to create layers, assemble images, and push to any OCI registry
-- **Multi-arch support** — build images for `amd64`, `arm64`, and other architectures
-- **Layer caching** — content-addressable local blob cache for fast incremental builds
-- **Registry push** — push directly to Docker Hub, ECR, GCR, ACR, GitHub Container Registry, or any OCI-compliant registry
-- **Authentication** — supports anonymous, basic auth, and token-based registry authentication
+- 🔥 **Blazingly fast** — native Rust, zstd layer compression, and content-addressable blob caching. Builds images in milliseconds, not seconds.
+- ☁️ **Runs anywhere** — serverless functions, sandboxed CI, edge runtimes, CLIs. If Rust runs there, Dockdash works there.
+- 🐳 **No Docker required** — no daemon, no socket, no root. Just a library call.
+- 🧱 **Simple API** — a builder pattern for layers and images. No Dockerfiles, no shelling out.
+- 🌍 **Multi-arch** — build for `amd64`, `arm64`, and any other platform you need.
+- 📦 **Push to any OCI registry** — Docker Hub, ECR, GCR, ACR, GHCR, or your own. Anonymous, basic auth, and token auth supported.
+- ⚡ **Incremental builds** — local content-addressable cache means unchanged layers are reused instantly.
 
 ## Quick Start
 
@@ -161,11 +163,11 @@ let opts = PushOptions {
 
 ## Use Cases
 
-- **CI/CD pipelines** — build container images without Docker-in-Docker or privileged containers
-- **Serverless functions** — dynamically build and push images from Lambda, Cloud Functions, etc.
-- **CLI tools** — embed container image building into your Rust CLI
-- **Platform tooling** — build images as part of a deployment platform without requiring Docker on the host
-- **Edge computing** — build images on resource-constrained devices
+- **Serverless functions** — build and push images from Lambda, Cloud Run, Vercel, or Cloudflare Workers, in milliseconds.
+- **CI/CD pipelines** — ship container images without Docker-in-Docker, root, or privileged runners.
+- **Deployment platforms** — bake user code into images on the fly as part of your build/deploy pipeline.
+- **CLI tools** — embed container image building directly into your Rust CLI, no external dependencies.
+- **Edge & embedded** — build images on resource-constrained devices where Docker simply isn't an option.
 
 ## Testing
 

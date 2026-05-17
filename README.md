@@ -34,7 +34,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-dockdash = "0.1"
+dockdash = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 

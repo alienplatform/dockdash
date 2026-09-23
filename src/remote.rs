@@ -7,6 +7,7 @@ use oci_client::{
     secrets::RegistryAuth,
     Reference, RegistryOperation,
 };
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::fs;
@@ -39,10 +40,7 @@ impl RemotePlatform {
     fn matches(&self, platform: &Platform) -> bool {
         platform.os == self.os
             && platform.architecture == self.architecture
-            && match self.variant.as_ref() {
-                Some(variant) => platform.variant.as_ref() == Some(variant),
-                None => true,
-            }
+            && self.variant == platform.variant
     }
 
     fn as_oci_platform(&self) -> Platform {
@@ -212,21 +210,20 @@ pub async fn derive_remote_image(
             ),
             "derived architecture",
         )?;
+        let derived_manifest = OciManifest::Image(derived_manifest);
+        let manifest_bytes = canonical_manifest_bytes(&derived_manifest)?;
+        let digest = format!("sha256:{:x}", Sha256::digest(&manifest_bytes));
         client
-            .push_manifest(
+            .push_manifest_raw(
                 &architecture_reference,
-                &OciManifest::Image(derived_manifest),
+                manifest_bytes.clone(),
+                derived_manifest
+                    .content_type()
+                    .parse()
+                    .expect("OCI media type is valid"),
             )
             .await
             .map_err(|error| registry_error("publish a derived architecture manifest", error))?;
-        let (manifest_bytes, digest) = client
-            .pull_manifest_raw(
-                &architecture_reference,
-                &options.target_auth,
-                &[OCI_IMAGE_MEDIA_TYPE],
-            )
-            .await
-            .map_err(|error| registry_error("verify a derived architecture manifest", error))?;
         derived_entries.push(ImageIndexEntry {
             media_type: OCI_IMAGE_MEDIA_TYPE.to_string(),
             digest,
@@ -245,14 +242,20 @@ pub async fn derive_remote_image(
         artifact_type: None,
         annotations: None,
     };
+    let index = OciManifest::ImageIndex(index);
+    let index_bytes = canonical_manifest_bytes(&index)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&index_bytes));
     client
-        .push_manifest(&target, &OciManifest::ImageIndex(index))
+        .push_manifest_raw(
+            &target,
+            index_bytes,
+            index
+                .content_type()
+                .parse()
+                .expect("OCI media type is valid"),
+        )
         .await
         .map_err(|error| registry_error("publish the derived image index", error))?;
-    let (_, digest) = client
-        .pull_manifest_raw(&target, &options.target_auth, &[OCI_IMAGE_INDEX_MEDIA_TYPE])
-        .await
-        .map_err(|error| registry_error("verify the derived image index", error))?;
 
     info!(%digest, uploaded_bytes, "Published registry-native derived image");
     Ok(RemoteDerivedImage {
@@ -411,6 +414,19 @@ fn descriptor_for_bytes(media_type: &str, bytes: &[u8]) -> Result<OciDescriptor>
         urls: None,
         annotations: None,
     })
+}
+
+fn canonical_manifest_bytes(manifest: &OciManifest) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut serializer =
+        serde_json::Serializer::with_formatter(&mut bytes, olpc_cjson::CanonicalFormatter::new());
+    manifest
+        .serialize(&mut serializer)
+        .map_err(|source| Error::ImageConfig {
+            message: "Failed to serialize OCI manifest".to_string(),
+            source: Some(Box::new(source)),
+        })?;
+    Ok(bytes)
 }
 
 fn json_string<'a>(value: &'a Value, key: &str) -> Result<&'a str> {

@@ -13,7 +13,7 @@ use oci_client::{
 };
 use std::{
     io::Read,
-    net::{TcpListener, TcpStream},
+    net::TcpStream,
     process::Command,
     thread,
     time::{Duration, Instant},
@@ -28,11 +28,6 @@ impl Drop for RegistryContainer {
 }
 
 fn start_registry() -> (RegistryContainer, String) {
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
     let name = format!("dockdash-remote-test-{}", std::process::id());
     let status = Command::new("docker")
         .args([
@@ -42,12 +37,28 @@ fn start_registry() -> (RegistryContainer, String) {
             "--name",
             &name,
             "--publish",
-            &format!("127.0.0.1:{port}:5000"),
+            "127.0.0.1::5000",
             "registry:2",
         ])
         .status()
         .expect("Docker is required for the remote derivation integration test");
     assert!(status.success(), "failed to start registry:2");
+    let port_output = Command::new("docker")
+        .args(["port", &name, "5000/tcp"])
+        .output()
+        .expect("inspect registry port");
+    assert!(
+        port_output.status.success(),
+        "failed to inspect registry port"
+    );
+    let mapping = String::from_utf8(port_output.stdout).expect("registry port is UTF-8");
+    let port: u16 = mapping
+        .trim()
+        .rsplit_once(':')
+        .expect("registry port mapping has a colon")
+        .1
+        .parse()
+        .expect("registry port is numeric");
     let deadline = Instant::now() + Duration::from_secs(15);
     while TcpStream::connect(("127.0.0.1", port)).is_err() {
         assert!(Instant::now() < deadline, "registry:2 did not become ready");

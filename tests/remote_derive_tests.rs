@@ -165,8 +165,16 @@ async fn derives_multi_platform_image_without_copying_base_layers() -> Result<()
         RemotePlatform::linux("arm64"),
     ];
 
+    let first_started = Instant::now();
     let first = derive_remote_image(&base, &target, &platforms, &config_layer, &options).await?;
+    let first_elapsed = first_started.elapsed();
+    let second_started = Instant::now();
     let second = derive_remote_image(&base, &target, &platforms, &config_layer, &options).await?;
+    let second_elapsed = second_started.elapsed();
+    eprintln!(
+        "remote derivation: first={first_elapsed:?}, repeat={second_elapsed:?}, uploaded={} bytes",
+        first.bytes_uploaded
+    );
 
     assert_eq!(
         first.digest, second.digest,

@@ -117,7 +117,7 @@ async fn derives_multi_platform_image_without_copying_base_layers() -> Result<()
                 os: "linux".to_string(),
                 os_version: None,
                 os_features: None,
-                variant: None,
+                variant: (architecture == "arm64").then(|| "v8".to_string()),
                 features: None,
             }),
             annotations: None,
@@ -192,6 +192,12 @@ async fn derives_multi_platform_image_without_copying_base_layers() -> Result<()
     assert_eq!(derived_index.manifests.len(), 2);
 
     for entry in derived_index.manifests {
+        let platform = entry.platform.as_ref().expect("derived platform metadata");
+        assert_eq!(
+            platform.variant.as_deref(),
+            (platform.architecture == "arm64").then_some("v8"),
+            "the source architecture variant must be preserved"
+        );
         let manifest_ref = target_ref.clone_with_digest(entry.digest);
         let (manifest, _) = client
             .pull_image_manifest(&manifest_ref, &auth)

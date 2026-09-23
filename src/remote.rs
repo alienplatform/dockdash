@@ -40,7 +40,10 @@ impl RemotePlatform {
     fn matches(&self, platform: &Platform) -> bool {
         platform.os == self.os
             && platform.architecture == self.architecture
-            && self.variant == platform.variant
+            && self
+                .variant
+                .as_ref()
+                .is_none_or(|variant| platform.variant.as_ref() == Some(variant))
     }
 
     fn as_oci_platform(&self) -> Platform {
@@ -156,7 +159,7 @@ pub async fn derive_remote_image(
 
     let mut derived_entries = Vec::with_capacity(platforms.len());
     for platform in platforms {
-        let base_image =
+        let (base_image, resolved_platform) =
             resolve_platform_manifest(&client, &base, &base_manifest, platform, options).await?;
         for descriptor in &base_image.layers {
             mount_base_blob(&client, &target, &base, descriptor).await?;
@@ -200,9 +203,9 @@ pub async fn derive_remote_image(
                 target.registry(),
                 target.repository(),
                 target_tag,
-                platform.os,
-                platform.architecture,
-                platform
+                resolved_platform.os,
+                resolved_platform.architecture,
+                resolved_platform
                     .variant
                     .as_ref()
                     .map(|variant| format!("-{variant}"))
@@ -230,7 +233,7 @@ pub async fn derive_remote_image(
             size: i64::try_from(manifest_bytes.len()).map_err(|_| {
                 generic_error("derived manifest is too large for an OCI descriptor")
             })?,
-            platform: Some(platform.as_oci_platform()),
+            platform: Some(resolved_platform.as_oci_platform()),
             annotations: None,
         });
     }
@@ -272,17 +275,17 @@ async fn resolve_platform_manifest(
     manifest: &OciManifest,
     platform: &RemotePlatform,
     options: &RemoteDeriveOptions,
-) -> Result<OciImageManifest> {
+) -> Result<(OciImageManifest, RemotePlatform)> {
     match manifest {
         OciManifest::Image(image) => {
             let actual = platform_from_image_config(client, base, image).await?;
-            if &actual != platform {
+            if !platform.matches(&actual.as_oci_platform()) {
                 return Err(generic_error(format!(
                     "base image is {}/{}, not {}/{}",
                     actual.os, actual.architecture, platform.os, platform.architecture
                 )));
             }
-            Ok(image.clone())
+            Ok((image.clone(), actual))
         }
         OciManifest::ImageIndex(index) => {
             let entry = index
@@ -300,12 +303,27 @@ async fn resolve_platform_manifest(
                         platform.os, platform.architecture
                     ))
                 })?;
+            let resolved_platform = entry
+                .platform
+                .as_ref()
+                .map(RemotePlatform::from)
+                .expect("matched entries have a platform");
             let reference = base.clone_with_digest(entry.digest.clone());
             let (manifest, _) = client
                 .pull_image_manifest(&reference, &options.source_auth)
                 .await
                 .map_err(|error| registry_error("read a platform base manifest", error))?;
-            Ok(manifest)
+            Ok((manifest, resolved_platform))
+        }
+    }
+}
+
+impl From<&Platform> for RemotePlatform {
+    fn from(platform: &Platform) -> Self {
+        Self {
+            os: platform.os.clone(),
+            architecture: platform.architecture.clone(),
+            variant: platform.variant.clone(),
         }
     }
 }

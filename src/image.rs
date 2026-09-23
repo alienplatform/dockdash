@@ -1553,7 +1553,10 @@ fn determine_registry_auth(reference: &Reference) -> RegistryAuth {
 }
 
 /// Determines whether to use monolithic push based on the policy and registry hostname.
-fn determine_use_monolithic_push(policy: &MonolithicPushPolicy, reference: &Reference) -> bool {
+pub(crate) fn determine_use_monolithic_push(
+    policy: &MonolithicPushPolicy,
+    reference: &Reference,
+) -> bool {
     match policy {
         MonolithicPushPolicy::Always => {
             debug!("MonolithicPushPolicy::Always - using monolithic push");

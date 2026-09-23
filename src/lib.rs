@@ -44,6 +44,9 @@ pub use layer::*;
 mod image;
 pub use image::*;
 
+mod remote;
+pub use remote::*;
+
 mod blobcache;
 pub use blobcache::*;
 

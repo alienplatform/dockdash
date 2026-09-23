@@ -184,6 +184,28 @@ async fn derives_multi_platform_image_without_copying_base_layers() -> Result<()
     assert!(first.bytes_uploaded > 0);
     assert_eq!(second.bytes_uploaded, 0, "all blobs should already exist");
 
+    // The release image and derived tags may share a repository. In that
+    // case the base blobs are already present and require no mount request.
+    let same_repository_target = format!("{base_repository}:project-acme-v1");
+    let same_repository = derive_remote_image(
+        &base,
+        &same_repository_target,
+        &platforms,
+        &config_layer,
+        &options,
+    )
+    .await?;
+    assert_eq!(same_repository.base_layer_bytes_downloaded, 0);
+    let same_repository_ref: Reference = same_repository_target.parse().unwrap();
+    let (same_repository_manifest, _) = client
+        .pull_manifest(&same_repository_ref, &auth)
+        .await
+        .unwrap();
+    assert!(matches!(
+        same_repository_manifest,
+        OciManifest::ImageIndex(_)
+    ));
+
     let target_ref: Reference = target.parse().unwrap();
     let (derived, _) = client.pull_manifest(&target_ref, &auth).await.unwrap();
     let OciManifest::ImageIndex(derived_index) = derived else {

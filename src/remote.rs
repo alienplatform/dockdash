@@ -97,7 +97,7 @@ pub struct RemoteDerivedImage {
     pub bytes_uploaded: u64,
 }
 
-/// Derives a multi-platform image by mounting every base filesystem layer and
+/// Derives a multi-platform image by reusing base filesystem layers and
 /// appending one small layer, without downloading any base filesystem layer.
 ///
 /// The source and target registries must support OCI cross-repository blob
@@ -358,6 +358,16 @@ async fn mount_base_blob(
     source: &Reference,
     descriptor: &OciDescriptor,
 ) -> Result<()> {
+    // A blob in the same repository is already addressable by digest. Some
+    // registries (notably ECR Public) return 202 for a self-mount even though
+    // the blob exists, so do not require a cross-repository mount here.
+    if target.registry() == source.registry() && target.repository() == source.repository() {
+        debug!(
+            digest = descriptor.digest,
+            "Base layer already belongs to target repository"
+        );
+        return Ok(());
+    }
     client
         .mount_blob(target, source, &descriptor.digest)
         .await

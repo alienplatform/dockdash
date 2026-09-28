@@ -436,7 +436,8 @@ impl LayerBuilder {
     /// - `uid`, `gid`: Numeric owner written into the tar header.
     ///
     /// Missing parent directories are added as root-owned `0o755`, as for files. Files added
-    /// under this path later do not emit a second, root-owned header for it.
+    /// under this path later reuse this entry. If files were added under it first, their
+    /// implicit root-owned entry precedes this one, and this later entry wins on extraction.
     #[instrument(level = "info", skip(self), fields(archive_path = %archive_path.as_ref().display(), mode, uid, gid))]
     pub fn empty_directory(
         mut self,

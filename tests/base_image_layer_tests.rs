@@ -144,6 +144,13 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
         .await?;
 
     let config = image_config(&pulled);
+    let mut pulled_archive = OciArtifact::from_oci_archive(pulled.path()).unwrap();
+    let (_, raw_config) = pulled_archive.get_config().unwrap();
+    let raw: serde_json::Value = serde_json::from_slice(&raw_config).unwrap();
+    assert!(
+        raw["config"]["ExposedPorts"]["8080/tcp"].is_object(),
+        "ExposedPorts must be an object keyed by port: {raw}"
+    );
     assert_eq!(config.architecture().to_string(), "amd64");
     let process = config.config().as_ref().unwrap();
     let env = process.env().clone().unwrap();

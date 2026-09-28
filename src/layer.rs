@@ -67,6 +67,8 @@ struct FileMetadata {
     is_dir: bool,
     /// Optional content hash for in-memory data (where mtime is meaningless)
     content_hash: Option<[u8; 32]>,
+    /// Explicit uid/gid; hashed only when set so existing cache keys stay stable.
+    owner: Option<(u64, u64)>,
 }
 
 /// Builder for creating `Layer` instances.
@@ -151,6 +153,10 @@ impl LayerBuilder {
             hasher.update([meta.is_dir as u8]);
             if let Some(ref hash) = meta.content_hash {
                 hasher.update(hash);
+            }
+            if let Some((uid, gid)) = meta.owner {
+                hasher.update(uid.to_le_bytes());
+                hasher.update(gid.to_le_bytes());
             }
         }
 
@@ -267,6 +273,7 @@ impl LayerBuilder {
                 mode,
                 is_dir: entry_metadata.is_dir(),
                 content_hash: None,
+                owner: None,
             });
         }
 
@@ -351,6 +358,7 @@ impl LayerBuilder {
             mode: file_mode,
             is_dir: false,
             content_hash: None,
+            owner: None,
         });
 
         if let Some(new_mode) = mode {
@@ -393,14 +401,98 @@ impl LayerBuilder {
     ///   An archive_path of "/" is invalid for data.
     /// - `content`: The byte slice containing the file content.
     /// - `mode`: The file mode (permissions) to set for the data in the tar archive. Defaults to `0o644` if `None`.
+    ///
+    /// The entry is owned by root (uid 0, gid 0). Use [`LayerBuilder::data_with_owner`] to set another owner.
     #[instrument(level = "info", skip(self, content), fields(archive_path = %archive_path.as_ref().display(), content_len = content.len(), mode))]
     pub fn data(
-        mut self,
+        self,
         archive_path: impl AsRef<Path>,
         content: &[u8],
         mode: Option<u32>,
     ) -> Result<Self> {
-        let ap_ref = archive_path.as_ref();
+        self.append_data_entry(archive_path.as_ref(), content, mode.unwrap_or(0o644), None)
+    }
+
+    /// Adds data from an in-memory byte slice as a file with an explicit owner and mode.
+    ///
+    /// Same path rules as [`LayerBuilder::data`]. `uid` and `gid` are numeric ids written into
+    /// the tar header, which is what the container runtime applies when it unpacks the layer.
+    #[instrument(level = "info", skip(self, content), fields(archive_path = %archive_path.as_ref().display(), content_len = content.len(), mode, uid, gid))]
+    pub fn data_with_owner(
+        self,
+        archive_path: impl AsRef<Path>,
+        content: &[u8],
+        mode: u32,
+        uid: u64,
+        gid: u64,
+    ) -> Result<Self> {
+        self.append_data_entry(archive_path.as_ref(), content, mode, Some((uid, gid)))
+    }
+
+    /// Adds an empty directory entry with an explicit owner and mode.
+    ///
+    /// - `archive_path`: Path of the directory within the layer. "/" is invalid.
+    /// - `mode`: The directory mode (e.g. `0o700`).
+    /// - `uid`, `gid`: Numeric owner written into the tar header.
+    ///
+    /// Missing parent directories are added as root-owned `0o755`, as for files. Files added
+    /// under this path later do not emit a second, root-owned header for it.
+    #[instrument(level = "info", skip(self), fields(archive_path = %archive_path.as_ref().display(), mode, uid, gid))]
+    pub fn empty_directory(
+        mut self,
+        archive_path: impl AsRef<Path>,
+        mode: u32,
+        uid: u64,
+        gid: u64,
+    ) -> Result<Self> {
+        let normalized_ap = normalize_archive_path(archive_path.as_ref());
+        if normalized_ap.as_os_str().is_empty() {
+            return Err(Error::InvalidPath {
+                message: "Archive path for a directory entry cannot be the root directory ('/') or empty."
+                    .to_string(),
+            });
+        }
+
+        self.ensure_parent_dirs_exist(&normalized_ap)?;
+
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mtime(0);
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_mode(mode);
+        header.set_entry_type(tar::EntryType::Directory);
+        let empty_data: &[u8] = &[];
+        self.tar_writer
+            .append_data(&mut header, &normalized_ap, empty_data)
+            .map_err(|e| Error::Io {
+                source: e,
+                message: format!(
+                    "Failed to append directory entry {} to tar",
+                    normalized_ap.display()
+                ),
+            })?;
+        self.created_archive_dirs.insert(normalized_ap.clone());
+
+        self.file_metadata.push(FileMetadata {
+            archive_path: normalized_ap,
+            size: 0,
+            mtime: 0,
+            mode,
+            is_dir: true,
+            content_hash: None,
+            owner: Some((uid, gid)),
+        });
+        Ok(self)
+    }
+
+    fn append_data_entry(
+        mut self,
+        ap_ref: &Path,
+        content: &[u8],
+        mode: u32,
+        owner: Option<(u64, u64)>,
+    ) -> Result<Self> {
         info!(
             "Adding data to layer. Original archive path: {}",
             ap_ref.display()
@@ -422,12 +514,13 @@ impl LayerBuilder {
 
         self.ensure_parent_dirs_exist(&normalized_ap)?;
 
+        let (uid, gid) = owner.unwrap_or((0, 0));
         let mut header = tar::Header::new_gnu();
         header.set_size(content.len() as u64);
         header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mode(mode.unwrap_or(0o644));
+        header.set_uid(uid);
+        header.set_gid(gid);
+        header.set_mode(mode);
         // `append_data` sets the path in the header and calculates checksum.
         self.tar_writer
             .append_data(&mut header, &normalized_ap, content)
@@ -453,9 +546,10 @@ impl LayerBuilder {
             archive_path: normalized_ap,
             size: content.len() as u64,
             mtime: 0,
-            mode: mode.unwrap_or(0o644),
+            mode,
             is_dir: false,
             content_hash: Some(content_hash),
+            owner,
         });
 
         debug!("Successfully added data to layer.");
@@ -1575,6 +1669,105 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    /// (path, entry type, uid, gid, mode) for every entry, in tar order.
+    fn list_tar_headers(layer_path: &Path) -> Vec<(String, tar::EntryType, u64, u64, u32)> {
+        let decoder = zstd::Decoder::new(File::open(layer_path).unwrap()).unwrap();
+        let mut archive = Archive::new(decoder);
+        archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let header = entry.header();
+                (
+                    entry
+                        .path()
+                        .unwrap()
+                        .to_string_lossy()
+                        .trim_end_matches('/')
+                        .to_string(),
+                    header.entry_type(),
+                    header.uid().unwrap(),
+                    header.gid().unwrap(),
+                    header.mode().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_entries_carry_explicit_owner_and_mode() -> Result<()> {
+        let layer = Layer::builder()?
+            .data("/usr/local/bin/agent", b"binary", Some(0o755))?
+            .data_with_owner("/etc/passwd", b"root:x:0:0::/root:/bin/sh\n", 0o644, 0, 0)?
+            .empty_directory("/workspace", 0o700, 1000, 1000)?
+            .data_with_owner("/workspace/owned.txt", b"x", 0o600, 1000, 1000)?
+            .build()
+            .await?;
+
+        let headers = list_tar_headers(layer.path());
+        let find = |path: &str| {
+            let matches: Vec<_> = headers.iter().filter(|h| h.0 == path).collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected one entry for {path}: {headers:?}"
+            );
+            matches[0].clone()
+        };
+
+        let agent = find("usr/local/bin/agent");
+        assert_eq!((agent.2, agent.3, agent.4), (0, 0, 0o755));
+        let passwd = find("etc/passwd");
+        assert_eq!((passwd.2, passwd.3, passwd.4), (0, 0, 0o644));
+        let dir = find("workspace");
+        assert_eq!(dir.1, tar::EntryType::Directory);
+        assert_eq!((dir.2, dir.3, dir.4), (1000, 1000, 0o700));
+        let owned = find("workspace/owned.txt");
+        assert_eq!((owned.2, owned.3, owned.4), (1000, 1000, 0o600));
+        let parent = find("usr/local/bin");
+        assert_eq!((parent.2, parent.3, parent.4), (0, 0, 0o755));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_owner_is_part_of_the_layer_cache_key() -> Result<()> {
+        let cache_dir = tempdir().unwrap();
+        let cache = blobcache::BlobCache::with_path(cache_dir.path().to_path_buf())?;
+
+        let as_root = Layer::builder()?
+            .blob_cache(cache.clone())
+            .data_with_owner("state/file", b"same bytes", 0o600, 0, 0)?
+            .build()
+            .await?;
+        let as_user = Layer::builder()?
+            .blob_cache(cache.clone())
+            .data_with_owner("state/file", b"same bytes", 0o600, 1000, 1000)?
+            .build()
+            .await?;
+        assert_ne!(as_root.diff_id(), as_user.diff_id());
+
+        let dir_root = Layer::builder()?
+            .blob_cache(cache.clone())
+            .empty_directory("state", 0o700, 0, 0)?
+            .build()
+            .await?;
+        let dir_user = Layer::builder()?
+            .blob_cache(cache)
+            .empty_directory("state", 0o700, 1000, 1000)?
+            .build()
+            .await?;
+        assert_ne!(dir_root.diff_id(), dir_user.diff_id());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_directory_root_path_error() -> Result<()> {
+        let result = Layer::builder()?.empty_directory("/", 0o755, 0, 0);
+        assert!(matches!(result, Err(Error::InvalidPath { .. })));
         Ok(())
     }
 }

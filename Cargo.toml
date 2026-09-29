@@ -33,6 +33,9 @@ zstd = "0.13"
 flate2 = "1"
 walkdir = "2"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 bollard = "0.18"
 futures-util = "0.3"

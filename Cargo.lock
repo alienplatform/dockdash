@@ -615,6 +615,7 @@ dependencies = [
  "dotenvy",
  "flate2",
  "futures-util",
+ "libc",
  "oci-client",
  "oci-spec 0.6.8",
  "oci-tar-builder",

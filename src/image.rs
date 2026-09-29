@@ -1728,7 +1728,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let Some(parent) = whiteout_parent(&canonical_target, &entry_path) else {
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
                 continue;
             };
             for child in std_fs::read_dir(&parent)? {
@@ -1746,7 +1746,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
                 warn!(path = %entry_path.display(), "Skipping whiteout: not a single file name");
                 continue;
             }
-            let Some(parent) = whiteout_parent(&canonical_target, &entry_path) else {
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
                 continue;
             };
             let target_path = parent.join(target_name);
@@ -1775,12 +1775,12 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 }
 
 /// Resolves the directory a whiteout entry acts on, or `None` when it is missing, not a
-/// directory, does not resolve, or resolves outside `canonical_target`. Whiteouts delete rather than unpack,
+/// directory, a symlink loop, or resolves outside `canonical_target`. Whiteouts delete rather than unpack,
 /// so they need the `..` and symlinked-parent checks `unpack_in` applies to other entries.
-fn whiteout_parent(canonical_target: &Path, entry_path: &Path) -> Option<PathBuf> {
+fn whiteout_parent(canonical_target: &Path, entry_path: &Path) -> std::io::Result<Option<PathBuf>> {
     let Some(relative) = normalize_layer_path(entry_path) else {
         warn!(path = %entry_path.display(), "Skipping whiteout: path contains '..'");
-        return None;
+        return Ok(None);
     };
     let parent = canonical_target.join(relative.parent().unwrap_or_else(|| Path::new("")));
     let resolved = match parent.canonicalize() {
@@ -1789,24 +1789,31 @@ fn whiteout_parent(canonical_target: &Path, entry_path: &Path) -> Option<PathBuf
             if matches!(
                 e.kind(),
                 std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-            ) =>
+            ) || is_symlink_loop(&e) =>
         {
-            return None;
+            return Ok(None);
         }
-        // Any other failure (a symlink loop, say) leaves no directory this marker could clear.
-        Err(e) => {
-            warn!(path = %entry_path.display(), error = %e, "Skipping whiteout: parent does not resolve");
-            return None;
-        }
+        Err(e) => return Err(e),
     };
     if !resolved.is_dir() {
-        return None;
+        return Ok(None);
     }
     if !resolved.starts_with(canonical_target) {
         warn!(path = %entry_path.display(), "Skipping whiteout: path escapes target directory");
-        return None;
+        return Ok(None);
     }
-    Some(resolved)
+    Ok(Some(resolved))
+}
+
+/// A symlink loop has no directory behind it, so a whiteout under one has nothing to clear.
+fn is_symlink_loop(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(libc::ELOOP);
+    // ERROR_CANT_RESOLVE_FILENAME
+    #[cfg(windows)]
+    return e.raw_os_error() == Some(1921);
+    #[cfg(not(any(unix, windows)))]
+    return false;
 }
 
 /// True for a plain name such as `foo`; false for `""`, `.`, `..` or a Windows drive prefix,

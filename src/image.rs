@@ -20,7 +20,7 @@ use oci_spec::image::{ImageConfiguration, ImageManifest as SpecImageManifest};
 use ocipkg::image::Image as _;
 use ocipkg::image::OciArtifact;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs as std_fs;
 use std::path::{Path, PathBuf};
@@ -229,6 +229,9 @@ impl Image {
             entrypoint: None,
             cmd: None,
             working_dir: None,
+            env: Vec::new(),
+            user: None,
+            exposed_ports: Vec::new(),
             output_path: None,
             blob_cache: None,
             output_image_name_and_tag: None,
@@ -354,6 +357,35 @@ impl Image {
     /// ImageMetadata containing entrypoint, cmd, and working_dir
     pub fn get_metadata(&self) -> Result<ImageMetadata> {
         Self::read_metadata_from_oci_archive(self.path())
+    }
+
+    /// Reads one file from the image's merged filesystem, without extracting it.
+    ///
+    /// Layers are searched from the top down, following OCI whiteouts: a `.wh.<name>` entry
+    /// for the file or one of its ancestors, an opaque `.wh..wh..opq` in an ancestor, or an
+    /// ancestor replaced by a regular file hides everything below it. A whiteout never hides
+    /// an entry in its own layer.
+    ///
+    /// Returns `Ok(None)` when the file does not exist. Fails when the topmost entry at `path`
+    /// is not a regular file, or an ancestor is a symlink or hard link, since links are not
+    /// followed.
+    #[instrument(skip(self), fields(image_path = %self.oci_archive_path.display(), path = %path.as_ref().display()))]
+    pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
+        let archive_path = self.oci_archive_path.clone();
+        let target = normalize_layer_path(path.as_ref())
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| Error::InvalidPath {
+                message: format!(
+                    "Cannot read '{}' as a file: the path is empty or contains '..'",
+                    path.as_ref().display()
+                ),
+            })?;
+        tokio::task::spawn_blocking(move || read_file_from_oci_archive(&archive_path, &target))
+            .await
+            .map_err(|e| Error::Join {
+                message: "Task join error while reading a file from image layers".to_string(),
+                source: e,
+            })?
     }
 
     /// Internal helper to read metadata from an OCI archive.
@@ -931,6 +963,9 @@ pub struct ImageBuilder {
     entrypoint: Option<Vec<String>>,
     cmd: Option<Vec<String>>,
     working_dir: Option<String>,
+    env: Vec<(String, String)>,
+    user: Option<String>,
+    exposed_ports: Vec<String>,
     output_path: Option<PathBuf>,
     blob_cache: Option<blobcache::BlobCache>,
     output_image_name_and_tag: Option<String>,
@@ -974,6 +1009,33 @@ impl ImageBuilder {
     /// Sets the working directory for the image. Overrides the working directory from the base image.
     pub fn working_dir(mut self, working_dir: &str) -> Self {
         self.working_dir = Some(working_dir.to_string());
+        self
+    }
+
+    /// Sets an environment variable, like Dockerfile `ENV key=value`.
+    ///
+    /// Replaces a base image variable with the same name and keeps the others.
+    /// Calling it again with the same key keeps the last value. `build()` fails when
+    /// `key` is empty or contains `=`.
+    pub fn env(mut self, key: &str, value: &str) -> Self {
+        self.env.retain(|(k, _)| k != key);
+        self.env.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    /// Sets the user the image runs as, like Dockerfile `USER` (e.g. `"1000:1000"`).
+    /// Overrides the user from the base image.
+    pub fn user(mut self, user: &str) -> Self {
+        self.user = Some(user.to_string());
+        self
+    }
+
+    /// Exposes a port, like Dockerfile `EXPOSE`. Pass it with its protocol (e.g. `"8080/tcp"`).
+    /// Added to the base image's exposed ports.
+    pub fn expose_port(mut self, port: &str) -> Self {
+        if !self.exposed_ports.iter().any(|p| p == port) {
+            self.exposed_ports.push(port.to_string());
+        }
         self
     }
 
@@ -1031,6 +1093,19 @@ impl ImageBuilder {
     ))]
     pub async fn build(mut self) -> Result<(Image, BuildDiagnostics)> {
         info!("Starting image build.");
+
+        if let Some((key, _)) = self
+            .env
+            .iter()
+            .find(|(k, _)| k.is_empty() || k.contains('='))
+        {
+            return Err(Error::ImageConfig {
+                message: format!(
+                    "Invalid environment variable name '{key}': it must be non-empty and must not contain '='"
+                ),
+                source: None,
+            });
+        }
 
         let target_os_for_build = self
             .platform_os
@@ -1376,6 +1451,22 @@ impl ImageBuilder {
             if let Some(working_dir) = self.working_dir {
                 proc_config.set_working_dir(Some(working_dir));
             }
+            if !self.env.is_empty() {
+                let merged = merge_env(proc_config.env().clone().unwrap_or_default(), &self.env);
+                proc_config.set_env(Some(merged));
+            }
+            if let Some(user) = self.user {
+                proc_config.set_user(Some(user));
+            }
+            if !self.exposed_ports.is_empty() {
+                let mut ports = proc_config.exposed_ports().clone().unwrap_or_default();
+                for port in self.exposed_ports {
+                    if !ports.contains(&port) {
+                        ports.push(port);
+                    }
+                }
+                proc_config.set_exposed_ports(Some(ports));
+            }
             config.set_os(target_os_for_build.as_str().into());
             config.set_architecture(target_arch_for_build.to_string().as_str().into());
             config.set_config(Some(proc_config));
@@ -1408,6 +1499,15 @@ impl ImageBuilder {
             }
             if let Some(working_dir) = self.working_dir {
                 config_builder = config_builder.working_dir(working_dir);
+            }
+            if !self.env.is_empty() {
+                config_builder = config_builder.env(merge_env(Vec::new(), &self.env));
+            }
+            if let Some(user) = self.user {
+                config_builder = config_builder.user(user);
+            }
+            if !self.exposed_ports.is_empty() {
+                config_builder = config_builder.exposed_ports(self.exposed_ports);
             }
 
             let proc_config = config_builder.build().map_err(|e| Error::ImageConfig {
@@ -1527,6 +1627,22 @@ impl ImageBuilder {
     }
 }
 
+/// Applies `KEY=VALUE` overrides to an OCI env list: an entry with the same key is replaced
+/// in place, new keys are appended.
+fn merge_env(mut base: Vec<String>, overrides: &[(String, String)]) -> Vec<String> {
+    for (key, value) in overrides {
+        let entry = format!("{key}={value}");
+        match base
+            .iter_mut()
+            .find(|e| e.split_once('=').map(|(k, _)| k).unwrap_or(e.as_str()) == key)
+        {
+            Some(existing) => *existing = entry,
+            None => base.push(entry),
+        }
+    }
+    base
+}
+
 /// Determines the RegistryAuth by trying environment variables and falling back to Anonymous.
 ///
 /// Note: `DOCKER_USERNAME`/`DOCKER_PASSWORD` env vars are applied to all registries.
@@ -1596,6 +1712,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
     mut archive: tar::Archive<R>,
     target_dir: &Path,
 ) -> std::io::Result<()> {
+    let canonical_target = target_dir.canonicalize()?;
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_path = entry.path()?.into_owned();
@@ -1611,26 +1728,28 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let parent = target_dir.join(entry_path.parent().unwrap_or_else(|| Path::new("")));
-            if parent.is_dir() {
-                for child in std_fs::read_dir(&parent)? {
-                    let child = child?;
-                    let child_path = child.path();
-                    if child_path.is_dir() {
-                        std_fs::remove_dir_all(&child_path)?;
-                    } else {
-                        std_fs::remove_file(&child_path)?;
-                    }
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
+                continue;
+            };
+            for child in std_fs::read_dir(&parent)? {
+                let child = child?;
+                let child_path = child.path();
+                if child_path.is_dir() {
+                    std_fs::remove_dir_all(&child_path)?;
+                } else {
+                    std_fs::remove_file(&child_path)?;
                 }
             }
         } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
             // Regular whiteout: delete the specific file/directory
-            let target_path = target_dir.join(
-                entry_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(""))
-                    .join(target_name),
-            );
+            if !is_single_name(target_name) {
+                warn!(path = %entry_path.display(), "Skipping whiteout: not a single file name");
+                continue;
+            }
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
+                continue;
+            };
+            let target_path = parent.join(target_name);
             let remove_result = if target_path.is_dir() {
                 std_fs::remove_dir_all(&target_path)
             } else {
@@ -1655,10 +1774,577 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
     Ok(())
 }
 
+/// Resolves the directory a whiteout entry acts on, or `None` when it is missing, not a
+/// directory, a symlink loop, or resolves outside `canonical_target`. Whiteouts delete rather than unpack,
+/// so they need the `..` and symlinked-parent checks `unpack_in` applies to other entries.
+fn whiteout_parent(canonical_target: &Path, entry_path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let Some(relative) = normalize_layer_path(entry_path) else {
+        warn!(path = %entry_path.display(), "Skipping whiteout: path contains '..'");
+        return Ok(None);
+    };
+    let parent = canonical_target.join(relative.parent().unwrap_or_else(|| Path::new("")));
+    let resolved = match parent.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) || is_symlink_loop(&e) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    };
+    if !resolved.is_dir() {
+        return Ok(None);
+    }
+    if !resolved.starts_with(canonical_target) {
+        warn!(path = %entry_path.display(), "Skipping whiteout: path escapes target directory");
+        return Ok(None);
+    }
+    Ok(Some(resolved))
+}
+
+/// A symlink loop has no directory behind it, so a whiteout under one has nothing to clear.
+fn is_symlink_loop(e: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    return e.raw_os_error() == Some(libc::ELOOP);
+    // ERROR_CANT_RESOLVE_FILENAME
+    #[cfg(windows)]
+    return e.raw_os_error() == Some(1921);
+    #[cfg(not(any(unix, windows)))]
+    return false;
+}
+
+/// True for a plain name such as `foo`; false for `""`, `.`, `..` or a Windows drive prefix,
+/// any of which would make `parent.join(name)` point somewhere other than a child.
+fn is_single_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == name
+    )
+}
+
+/// Strips `./`, a leading `/` and a trailing `/` so tar entry paths compare equal.
+/// `None` for a path with a `..` component, which extraction refuses to unpack.
+fn normalize_layer_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => return None,
+            _ => {}
+        }
+    }
+    Some(normalized)
+}
+
+/// What one layer says about the file being looked up.
+enum LayerLookup {
+    Found(Vec<u8>),
+    Hidden,
+    Absent,
+}
+
+fn read_file_from_oci_archive(archive_path: &Path, target: &Path) -> Result<Option<Vec<u8>>> {
+    let mut archive =
+        OciArtifact::from_oci_archive(archive_path).map_err(|e| Error::OciArchive {
+            message: format!(
+                "Failed to load OCI artifact from {}",
+                archive_path.display()
+            ),
+            source: Some(e.into()),
+        })?;
+    let manifest = archive.get_manifest().map_err(|e| Error::OciArchive {
+        message: "Failed to get manifest from OCI artifact".to_string(),
+        source: Some(e.into()),
+    })?;
+
+    for desc in manifest.layers().iter().rev() {
+        let digest = ocipkg::Digest::from_descriptor(desc).map_err(|e| Error::OciArchive {
+            message: format!("Invalid layer digest {}", desc.digest()),
+            source: Some(e.into()),
+        })?;
+        let blob = archive.get_blob(&digest).map_err(|e| Error::OciArchive {
+            message: format!("Failed to read layer blob {}", desc.digest()),
+            source: Some(e.into()),
+        })?;
+        let lookup_err = |e: std::io::Error| Error::Io {
+            message: format!(
+                "Failed to read {} from layer {}",
+                target.display(),
+                desc.digest()
+            ),
+            source: e,
+        };
+        let media_type = desc.media_type().to_string();
+        let cursor = std::io::Cursor::new(blob);
+        let lookup = if media_type.contains("+zstd") {
+            let decoder = zstd::Decoder::new(cursor).map_err(lookup_err)?;
+            lookup_in_layer(tar::Archive::new(decoder), target)
+        } else if media_type.contains("gzip") {
+            lookup_in_layer(
+                tar::Archive::new(flate2::read::GzDecoder::new(cursor)),
+                target,
+            )
+        } else {
+            lookup_in_layer(tar::Archive::new(cursor), target)
+        }
+        .map_err(|e| match e {
+            LookupError::Io(e) => lookup_err(e),
+            LookupError::NotRegular(kind) => Error::InvalidPath {
+                message: format!(
+                    "{} in layer {} is not a readable regular file ({kind})",
+                    target.display(),
+                    desc.digest()
+                ),
+            },
+        })?;
+        match lookup {
+            LayerLookup::Found(content) => return Ok(Some(content)),
+            LayerLookup::Hidden => return Ok(None),
+            LayerLookup::Absent => continue,
+        }
+    }
+    Ok(None)
+}
+
+enum LookupError {
+    Io(std::io::Error),
+    NotRegular(&'static str),
+}
+
+impl From<std::io::Error> for LookupError {
+    fn from(e: std::io::Error) -> Self {
+        LookupError::Io(e)
+    }
+}
+
+/// Scans a whole layer before deciding: a whiteout may follow the entry it hides in a lower
+/// layer and never hides one in its own layer, a repeated target path keeps its last entry,
+/// and a non-directory parent entry after the target hides it, as a layer apply removes the subtree.
+fn lookup_in_layer<R: std::io::Read>(
+    mut archive: tar::Archive<R>,
+    target: &Path,
+) -> std::result::Result<LayerLookup, LookupError> {
+    use std::io::Read as _;
+
+    let mut hidden = false;
+    let mut found: Option<(usize, std::result::Result<Vec<u8>, &'static str>)> = None;
+    let mut ancestor_types: HashMap<PathBuf, tar::EntryType> = HashMap::new();
+    let mut last_ancestor_replaced: Option<usize> = None;
+    for (index, entry_result) in archive.entries()?.enumerate() {
+        let mut entry = entry_result?;
+        let Some(entry_path) = normalize_layer_path(&entry.path()?) else {
+            continue;
+        };
+        let file_name = entry_path
+            .file_name()
+            .map(|n| n.as_encoded_bytes())
+            .unwrap_or_default();
+        let parent = entry_path.parent().unwrap_or_else(|| Path::new(""));
+
+        if file_name == b".wh..wh..opq" {
+            if target.starts_with(parent) {
+                hidden = true;
+            }
+        } else if let Some(name) = file_name.strip_prefix(b".wh.") {
+            let hides_target = target
+                .strip_prefix(parent)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .is_some_and(|c| c.as_os_str().as_encoded_bytes() == name);
+            if hides_target {
+                hidden = true;
+            }
+        } else if entry_path == target {
+            let entry_type = entry.header().entry_type();
+            let content = if entry_type.is_file() {
+                let mut content = Vec::new();
+                entry.read_to_end(&mut content)?;
+                Ok(content)
+            } else {
+                Err(match entry_type {
+                    tar::EntryType::Directory => "directory",
+                    tar::EntryType::Symlink => "symlink",
+                    tar::EntryType::Link => "hard link",
+                    _ => "special file",
+                })
+            };
+            found = Some((index, content));
+        } else if !entry_path.as_os_str().is_empty() && target.starts_with(&entry_path) {
+            let entry_type = entry.header().entry_type();
+            // A non-directory removes the whole subtree, even if a directory is recreated later.
+            if entry_type != tar::EntryType::Directory {
+                last_ancestor_replaced = Some(index);
+            }
+            ancestor_types.insert(entry_path, entry_type);
+        }
+    }
+    if ancestor_types
+        .values()
+        .any(|t| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
+    {
+        return Err(LookupError::NotRegular("an ancestor is a link"));
+    }
+    match found {
+        Some((index, _)) if last_ancestor_replaced.is_some_and(|a| a > index) => {
+            Ok(LayerLookup::Hidden)
+        }
+        Some((_, Ok(content))) => Ok(LayerLookup::Found(content)),
+        Some((_, Err(kind))) => Err(LookupError::NotRegular(kind)),
+        None if hidden || last_ancestor_replaced.is_some() => Ok(LayerLookup::Hidden),
+        None => Ok(LayerLookup::Absent),
+    }
+}
+
 /// Checks if a registry requires monolithic push based on its hostname.
 fn is_registry_requiring_monolithic_push(registry_host: &str) -> bool {
     // Google Artifact Registry and Container Registry require monolithic push
     registry_host.ends_with("-docker.pkg.dev") // Google Artifact Registry
         || registry_host == "gcr.io"
         || registry_host.ends_with(".gcr.io") // Google Container Registry
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn layer(entries: &[(&str, &[u8])]) -> Layer {
+        let mut builder = Layer::builder().unwrap();
+        for (path, content) in entries {
+            builder = builder.data(path, content, None).unwrap();
+        }
+        builder.build().await.unwrap()
+    }
+
+    async fn image(layers: Vec<Layer>) -> Image {
+        let mut builder = Image::builder();
+        for l in layers {
+            builder = builder.layer(l);
+        }
+        builder.build().await.unwrap().0
+    }
+
+    fn config(image: &Image) -> ImageConfiguration {
+        let mut archive = OciArtifact::from_oci_archive(image.path()).unwrap();
+        let (_, bytes) = archive.get_config().unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_the_topmost_copy() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"lower")]).await,
+            layer(&[("etc/passwd", b"upper")]).await,
+            layer(&[("etc/other", b"unrelated")]).await,
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"upper"
+        );
+        assert_eq!(
+            img.read_file("etc/passwd").await.unwrap().unwrap(),
+            b"upper"
+        );
+        assert_eq!(img.read_file("/etc/group").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_honours_whiteouts() {
+        let deleted = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/.wh.passwd", b"")]).await,
+        ])
+        .await;
+        assert_eq!(deleted.read_file("/etc/passwd").await.unwrap(), None);
+
+        let parent_deleted = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[(".wh.etc", b"")]).await,
+        ])
+        .await;
+        assert_eq!(parent_deleted.read_file("/etc/passwd").await.unwrap(), None);
+
+        let opaque = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/.wh..wh..opq", b""), ("etc/group", b"g")]).await,
+        ])
+        .await;
+        assert_eq!(opaque.read_file("/etc/passwd").await.unwrap(), None);
+        assert_eq!(opaque.read_file("/etc/group").await.unwrap().unwrap(), b"g");
+
+        let readded = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/.wh.passwd", b"")]).await,
+            layer(&[("etc/passwd", b"new")]).await,
+        ])
+        .await;
+        assert_eq!(
+            readded.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"new"
+        );
+
+        // A whiteout only hides lower layers, even when it follows the entry in tar order.
+        let same_layer = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/passwd", b"kept"), ("etc/.wh..wh..opq", b"")]).await,
+        ])
+        .await;
+        assert_eq!(
+            same_layer.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_takes_the_last_copy_within_a_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/passwd", b"first"), ("etc/passwd", b"second")]).await,
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"second"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_treats_an_ancestor_replaced_by_a_file_as_hiding_the_lower_file() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc", b"now a file")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_ignores_whiteouts_for_a_name_prefix() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/.wh.pass", b""), ("etcx/.wh..wh..opq", b"")]).await,
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"base"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_keeps_only_new_entries_of_a_parent_whited_out_and_recreated_in_one_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base"), ("etc/group", b"g")]).await,
+            layer(&[(".wh.etc", b""), ("etc/passwd", b"new")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap().unwrap(), b"new");
+        assert_eq!(img.read_file("/etc/group").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_hides_every_lower_file_under_a_root_opaque_marker() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[(".wh..wh..opq", b""), ("x", b"x")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_a_directory() {
+        let img = image(vec![layer(&[("etc/passwd", b"x")]).await]).await;
+        assert!(matches!(
+            img.read_file("/etc").await,
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            img.read_file("/").await,
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            img.read_file("/tmp/../etc/passwd").await,
+            Err(Error::InvalidPath { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_hides_a_file_whose_parent_is_replaced_then_recreated_in_one_layer() {
+        let empty = tempfile::tempdir().unwrap();
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            Layer::builder()
+                .unwrap()
+                .data("etc/passwd", b"upper", None)
+                .unwrap()
+                .data("etc", b"now a file", None)
+                .unwrap()
+                .directory(empty.path(), "etc")
+                .unwrap()
+                .build()
+                .await
+                .unwrap(),
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[test]
+    fn extraction_skips_a_whiteout_that_escapes_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir(&target).unwrap();
+        let outside = root.path().join("keep");
+        std_fs::write(&outside, b"x").unwrap();
+
+        let tar_bytes = raw_whiteout_layer(b"../.wh.keep");
+
+        extract_layer_with_whiteouts(tar::Archive::new(tar_bytes.as_slice()), &target).unwrap();
+        assert!(outside.exists());
+    }
+
+    fn raw_whiteout_layer(name: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_cksum();
+        builder.append(&header, &[][..]).unwrap();
+        builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn extraction_ignores_whiteouts_that_name_no_single_child() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir_all(target.join("dir")).unwrap();
+        std_fs::write(target.join("dir/keep"), b"x").unwrap();
+        std_fs::write(root.path().join("keep"), b"x").unwrap();
+        std_fs::write(target.join("file"), b"x").unwrap();
+
+        for name in [
+            &b".wh..."[..],
+            b".wh.",
+            b".wh..",
+            b"dir/.wh...",
+            b"file/.wh..wh..opq",
+            b"file/.wh.x",
+        ] {
+            let layer = raw_whiteout_layer(name);
+            extract_layer_with_whiteouts(tar::Archive::new(layer.as_slice()), &target).unwrap();
+        }
+        assert!(target.join("dir/keep").exists());
+        assert!(target.join("file").exists());
+        assert!(root.path().join("keep").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_prefix_is_not_a_single_name() {
+        assert!(!is_single_name("C:"));
+        assert!(!is_single_name("C:x"));
+        assert!(!is_single_name("a\\b"));
+        assert!(is_single_name("keep"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_keeps_whiteouts_inside_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir(&target).unwrap();
+        let outside = root.path().join("outside");
+        std_fs::create_dir(&outside).unwrap();
+        std_fs::write(outside.join("keep"), b"x").unwrap();
+        std_fs::write(target.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("evil")).unwrap();
+
+        for name in [&b"evil/.wh..wh..opq"[..], b"evil/.wh.keep"] {
+            let layer = raw_whiteout_layer(name);
+            extract_layer_with_whiteouts(tar::Archive::new(layer.as_slice()), &target).unwrap();
+        }
+        assert!(outside.join("keep").exists());
+
+        std::os::unix::fs::symlink("loop", target.join("loop")).unwrap();
+        let looped = raw_whiteout_layer(b"loop/.wh..wh..opq");
+        extract_layer_with_whiteouts(tar::Archive::new(looped.as_slice()), &target).unwrap();
+
+        let absolute = raw_whiteout_layer(b"/.wh.keep");
+        extract_layer_with_whiteouts(tar::Archive::new(absolute.as_slice()), &target).unwrap();
+        assert!(!target.join("keep").exists());
+        assert!(outside.join("keep").exists());
+    }
+
+    #[tokio::test]
+    async fn read_file_hides_a_file_whose_parent_is_replaced_later_in_its_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/passwd", b"upper"), ("etc", b"now a file")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn config_setters_apply_on_a_scratch_image() {
+        let (img, _) = Image::builder()
+            .env("A", "1")
+            .env("B", "2")
+            .env("A", "3")
+            .user("1000:1000")
+            .expose_port("8080/tcp")
+            .expose_port("8080/tcp")
+            .entrypoint(vec!["/app".to_string()])
+            .build()
+            .await
+            .unwrap();
+        let cfg = config(&img);
+        let process = cfg.config().as_ref().unwrap();
+        assert_eq!(
+            process.env().as_ref().unwrap(),
+            &vec!["B=2".to_string(), "A=3".to_string()]
+        );
+        assert_eq!(process.user().as_deref(), Some("1000:1000"));
+        assert_eq!(
+            process.exposed_ports().as_ref().unwrap(),
+            &vec!["8080/tcp".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rejects_an_invalid_env_name() {
+        for key in ["", "A=B"] {
+            let result = Image::builder().env(key, "v").build().await;
+            assert!(
+                matches!(result, Err(Error::ImageConfig { .. })),
+                "key {key:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn merge_env_replaces_only_the_exact_key() {
+        let merged = merge_env(
+            vec![
+                "PATH=/usr/bin".to_string(),
+                "PORT=1".to_string(),
+                "PORT_X=2".to_string(),
+            ],
+            &[
+                ("PORT".to_string(), "8080".to_string()),
+                ("NEW".to_string(), "v=w".to_string()),
+            ],
+        );
+        assert_eq!(
+            merged,
+            vec!["PATH=/usr/bin", "PORT=8080", "PORT_X=2", "NEW=v=w"]
+        );
+    }
 }

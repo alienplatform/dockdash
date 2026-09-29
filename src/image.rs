@@ -1731,15 +1731,13 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
             let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
                 continue;
             };
-            if parent.is_dir() {
-                for child in std_fs::read_dir(&parent)? {
-                    let child = child?;
-                    let child_path = child.path();
-                    if child_path.is_dir() {
-                        std_fs::remove_dir_all(&child_path)?;
-                    } else {
-                        std_fs::remove_file(&child_path)?;
-                    }
+            for child in std_fs::read_dir(&parent)? {
+                let child = child?;
+                let child_path = child.path();
+                if child_path.is_dir() {
+                    std_fs::remove_dir_all(&child_path)?;
+                } else {
+                    std_fs::remove_file(&child_path)?;
                 }
             }
         } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
@@ -2234,6 +2232,15 @@ mod tests {
         assert!(target.join("dir/keep").exists());
         assert!(target.join("file").exists());
         assert!(root.path().join("keep").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_prefix_is_not_a_single_name() {
+        assert!(!is_single_name("C:"));
+        assert!(!is_single_name("C:x"));
+        assert!(!is_single_name("a\\b"));
+        assert!(is_single_name("keep"));
     }
 
     #[cfg(unix)]

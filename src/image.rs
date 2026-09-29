@@ -1712,6 +1712,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
     mut archive: tar::Archive<R>,
     target_dir: &Path,
 ) -> std::io::Result<()> {
+    let canonical_target = target_dir.canonicalize()?;
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_path = entry.path()?.into_owned();
@@ -1727,7 +1728,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let Some(parent) = whiteout_parent(target_dir, &entry_path)? else {
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
                 continue;
             };
             if parent.is_dir() {
@@ -1743,7 +1744,11 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
             }
         } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
             // Regular whiteout: delete the specific file/directory
-            let Some(parent) = whiteout_parent(target_dir, &entry_path)? else {
+            if !is_single_name(target_name) {
+                warn!(path = %entry_path.display(), "Skipping whiteout: not a single file name");
+                continue;
+            }
+            let Some(parent) = whiteout_parent(&canonical_target, &entry_path)? else {
                 continue;
             };
             let target_path = parent.join(target_name);
@@ -1771,25 +1776,45 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
     Ok(())
 }
 
-/// Resolves the directory a whiteout entry acts on, or `None` when it does not exist or
-/// resolves outside `target_dir`. Whiteouts delete rather than unpack, so they need the
-/// same `..` and symlinked-parent checks that `unpack_in` applies to regular entries.
-fn whiteout_parent(target_dir: &Path, entry_path: &Path) -> std::io::Result<Option<PathBuf>> {
+/// Resolves the directory a whiteout entry acts on, or `None` when it is missing, not a
+/// directory, or resolves outside `canonical_target`. Whiteouts delete rather than unpack,
+/// so they need the `..` and symlinked-parent checks `unpack_in` applies to other entries.
+fn whiteout_parent(canonical_target: &Path, entry_path: &Path) -> std::io::Result<Option<PathBuf>> {
     let Some(relative) = normalize_layer_path(entry_path) else {
         warn!(path = %entry_path.display(), "Skipping whiteout: path contains '..'");
         return Ok(None);
     };
-    let parent = target_dir.join(relative.parent().unwrap_or_else(|| Path::new("")));
+    let parent = canonical_target.join(relative.parent().unwrap_or_else(|| Path::new("")));
     let resolved = match parent.canonicalize() {
         Ok(resolved) => resolved,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
         Err(e) => return Err(e),
     };
-    if !resolved.starts_with(target_dir.canonicalize()?) {
+    if !resolved.is_dir() {
+        return Ok(None);
+    }
+    if !resolved.starts_with(canonical_target) {
         warn!(path = %entry_path.display(), "Skipping whiteout: path escapes target directory");
         return Ok(None);
     }
     Ok(Some(resolved))
+}
+
+/// True for a plain name such as `foo`; false for `""`, `.`, `..` or a Windows drive prefix,
+/// any of which would make `parent.join(name)` point somewhere other than a child.
+fn is_single_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(
+        (components.next(), components.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == name
+    )
 }
 
 /// Strips `./`, a leading `/` and a trailing `/` so tar entry paths compare equal.
@@ -2184,6 +2209,31 @@ mod tests {
         header.set_cksum();
         builder.append(&header, &[][..]).unwrap();
         builder.into_inner().unwrap()
+    }
+
+    #[test]
+    fn extraction_ignores_whiteouts_that_name_no_single_child() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir_all(target.join("dir")).unwrap();
+        std_fs::write(target.join("dir/keep"), b"x").unwrap();
+        std_fs::write(root.path().join("keep"), b"x").unwrap();
+        std_fs::write(target.join("file"), b"x").unwrap();
+
+        for name in [
+            &b".wh..."[..],
+            b".wh.",
+            b".wh..",
+            b"dir/.wh...",
+            b"file/.wh..wh..opq",
+            b"file/.wh.x",
+        ] {
+            let layer = raw_whiteout_layer(name);
+            extract_layer_with_whiteouts(tar::Archive::new(layer.as_slice()), &target).unwrap();
+        }
+        assert!(target.join("dir/keep").exists());
+        assert!(target.join("file").exists());
+        assert!(root.path().join("keep").exists());
     }
 
     #[cfg(unix)]

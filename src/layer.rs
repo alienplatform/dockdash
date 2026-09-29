@@ -462,7 +462,7 @@ impl LayerBuilder {
         {
             return Err(Error::InvalidPath {
                 message: format!(
-                    "Directory {} already has an entry in this layer; add it before any entry under it",
+                    "Directory {} already has an entry at or under it in this layer; add the directory first",
                     normalized_ap.display()
                 ),
             });

@@ -1725,23 +1725,11 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
             }
         };
 
-        let is_whiteout = file_name.starts_with(".wh.");
-        // Whiteouts delete instead of unpacking, so unpack_in's traversal guard never sees them.
-        let whiteout_path = match normalize_layer_path(&entry_path) {
-            Some(path) => path,
-            None if is_whiteout => {
-                warn!(
-                    path = %entry_path.display(),
-                    "Skipping whiteout: path escapes target directory"
-                );
-                continue;
-            }
-            None => entry_path.clone(),
-        };
-
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let parent = target_dir.join(whiteout_path.parent().unwrap_or_else(|| Path::new("")));
+            let Some(parent) = whiteout_parent(target_dir, &entry_path)? else {
+                continue;
+            };
             if parent.is_dir() {
                 for child in std_fs::read_dir(&parent)? {
                     let child = child?;
@@ -1755,12 +1743,10 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
             }
         } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
             // Regular whiteout: delete the specific file/directory
-            let target_path = target_dir.join(
-                whiteout_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(""))
-                    .join(target_name),
-            );
+            let Some(parent) = whiteout_parent(target_dir, &entry_path)? else {
+                continue;
+            };
+            let target_path = parent.join(target_name);
             let remove_result = if target_path.is_dir() {
                 std_fs::remove_dir_all(&target_path)
             } else {
@@ -1783,6 +1769,27 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
         }
     }
     Ok(())
+}
+
+/// Resolves the directory a whiteout entry acts on, or `None` when it does not exist or
+/// resolves outside `target_dir`. Whiteouts delete rather than unpack, so they need the
+/// same `..` and symlinked-parent checks that `unpack_in` applies to regular entries.
+fn whiteout_parent(target_dir: &Path, entry_path: &Path) -> std::io::Result<Option<PathBuf>> {
+    let Some(relative) = normalize_layer_path(entry_path) else {
+        warn!(path = %entry_path.display(), "Skipping whiteout: path contains '..'");
+        return Ok(None);
+    };
+    let parent = target_dir.join(relative.parent().unwrap_or_else(|| Path::new("")));
+    let resolved = match parent.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !resolved.starts_with(target_dir.canonicalize()?) {
+        warn!(path = %entry_path.display(), "Skipping whiteout: path escapes target directory");
+        return Ok(None);
+    }
+    Ok(Some(resolved))
 }
 
 /// Strips `./`, a leading `/` and a trailing `/` so tar entry paths compare equal.
@@ -1880,9 +1887,9 @@ impl From<std::io::Error> for LookupError {
     }
 }
 
-/// Scans a whole layer before deciding: a whiteout may come after the entry it would hide
-/// in a lower layer and never hides an entry in its own layer, and when a path repeats in
-/// one layer the last entry wins, as on extraction.
+/// Scans a whole layer before deciding: a whiteout may follow the entry it hides in a lower
+/// layer and never hides one in its own layer, a repeated target path keeps its last entry,
+/// and a non-directory parent entry after the target hides it, as a layer apply removes the subtree.
 fn lookup_in_layer<R: std::io::Read>(
     mut archive: tar::Archive<R>,
     target: &Path,
@@ -2161,19 +2168,46 @@ mod tests {
         let outside = root.path().join("keep");
         std_fs::write(&outside, b"x").unwrap();
 
-        let mut tar_bytes = tar::Builder::new(Vec::new());
+        let tar_bytes = raw_whiteout_layer(b"../.wh.keep");
+
+        extract_layer_with_whiteouts(tar::Archive::new(tar_bytes.as_slice()), &target).unwrap();
+        assert!(outside.exists());
+    }
+
+    fn raw_whiteout_layer(name: &[u8]) -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
         header.set_size(0);
         header.set_mode(0o644);
         header.set_entry_type(tar::EntryType::Regular);
-        let name = b"../.wh.keep";
         header.as_old_mut().name[..name.len()].copy_from_slice(name);
         header.set_cksum();
-        tar_bytes.append(&header, &[][..]).unwrap();
-        let tar_bytes = tar_bytes.into_inner().unwrap();
+        builder.append(&header, &[][..]).unwrap();
+        builder.into_inner().unwrap()
+    }
 
-        extract_layer_with_whiteouts(tar::Archive::new(tar_bytes.as_slice()), &target).unwrap();
-        assert!(outside.exists());
+    #[cfg(unix)]
+    #[test]
+    fn extraction_keeps_whiteouts_inside_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir(&target).unwrap();
+        let outside = root.path().join("outside");
+        std_fs::create_dir(&outside).unwrap();
+        std_fs::write(outside.join("keep"), b"x").unwrap();
+        std_fs::write(target.join("keep"), b"x").unwrap();
+        std::os::unix::fs::symlink(&outside, target.join("evil")).unwrap();
+
+        for name in [&b"evil/.wh..wh..opq"[..], b"evil/.wh.keep"] {
+            let layer = raw_whiteout_layer(name);
+            extract_layer_with_whiteouts(tar::Archive::new(layer.as_slice()), &target).unwrap();
+        }
+        assert!(outside.join("keep").exists());
+
+        let absolute = raw_whiteout_layer(b"/.wh.keep");
+        extract_layer_with_whiteouts(tar::Archive::new(absolute.as_slice()), &target).unwrap();
+        assert!(!target.join("keep").exists());
+        assert!(outside.join("keep").exists());
     }
 
     #[tokio::test]

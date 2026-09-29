@@ -20,7 +20,7 @@ use oci_spec::image::{ImageConfiguration, ImageManifest as SpecImageManifest};
 use ocipkg::image::Image as _;
 use ocipkg::image::OciArtifact;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs as std_fs;
 use std::path::{Path, PathBuf};
@@ -1013,7 +1013,8 @@ impl ImageBuilder {
     /// Sets an environment variable, like Dockerfile `ENV key=value`.
     ///
     /// Replaces a base image variable with the same name and keeps the others.
-    /// Calling it again with the same key keeps the last value.
+    /// Calling it again with the same key keeps the last value. `build()` fails when
+    /// `key` is empty or contains `=`.
     pub fn env(mut self, key: &str, value: &str) -> Self {
         self.env.retain(|(k, _)| k != key);
         self.env.push((key.to_string(), value.to_string()));
@@ -1090,6 +1091,17 @@ impl ImageBuilder {
     ))]
     pub async fn build(mut self) -> Result<(Image, BuildDiagnostics)> {
         info!("Starting image build.");
+
+        if let Some((key, _)) = self
+            .env
+            .iter()
+            .find(|(k, _)| k.is_empty() || k.contains('='))
+        {
+            return Err(Error::ImageConfig {
+                message: format!("Invalid environment variable name '{key}'"),
+                source: None,
+            });
+        }
 
         let target_os_for_build = self
             .platform_os
@@ -1854,21 +1866,27 @@ fn lookup_in_layer<R: std::io::Read>(
 
     let mut hidden = false;
     let mut found: Option<std::result::Result<Vec<u8>, &'static str>> = None;
+    let mut ancestors: HashMap<PathBuf, tar::EntryType> = HashMap::new();
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_path = normalize_layer_path(&entry.path()?);
         let file_name = entry_path
             .file_name()
-            .and_then(|n| n.to_str())
+            .map(|n| n.as_encoded_bytes())
             .unwrap_or_default();
         let parent = entry_path.parent().unwrap_or_else(|| Path::new(""));
 
-        if file_name == ".wh..wh..opq" {
+        if file_name == b".wh..wh..opq" {
             if target.starts_with(parent) {
                 hidden = true;
             }
-        } else if let Some(name) = file_name.strip_prefix(".wh.") {
-            if target.starts_with(parent.join(name)) {
+        } else if let Some(name) = file_name.strip_prefix(b".wh.") {
+            let hides_target = target
+                .strip_prefix(parent)
+                .ok()
+                .and_then(|rest| rest.components().next())
+                .is_some_and(|c| c.as_os_str().as_encoded_bytes() == name);
+            if hides_target {
                 hidden = true;
             }
         } else if entry_path == target {
@@ -1886,14 +1904,17 @@ fn lookup_in_layer<R: std::io::Read>(
                 })
             });
         } else if !entry_path.as_os_str().is_empty() && target.starts_with(&entry_path) {
-            match entry.header().entry_type() {
-                tar::EntryType::Directory => {}
-                tar::EntryType::Symlink | tar::EntryType::Link => {
-                    return Err(LookupError::NotRegular("an ancestor is a link"));
-                }
-                _ => hidden = true,
-            }
+            ancestors.insert(entry_path, entry.header().entry_type());
         }
+    }
+    if ancestors
+        .values()
+        .any(|t| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
+    {
+        return Err(LookupError::NotRegular("an ancestor is a link"));
+    }
+    if ancestors.values().any(|t| *t != tar::EntryType::Directory) {
+        hidden = true;
     }
     match found {
         Some(Ok(content)) => Ok(LayerLookup::Found(content)),
@@ -2058,7 +2079,10 @@ mod tests {
         ])
         .await;
         assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
-        assert!(img.read_file("/").await.is_err());
+        assert!(matches!(
+            img.read_file("/").await,
+            Err(Error::InvalidPath { .. })
+        ));
     }
 
     #[tokio::test]
@@ -2093,6 +2117,38 @@ mod tests {
         assert_eq!(
             process.exposed_ports().as_ref().unwrap(),
             &vec!["8080/tcp".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn build_rejects_an_invalid_env_name() {
+        for key in ["", "A=B"] {
+            let result = Image::builder().env(key, "v").build().await;
+            assert!(
+                matches!(result, Err(Error::ImageConfig { .. })),
+                "key {key:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_takes_the_last_entry_for_an_ancestor_within_a_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            Layer::builder()
+                .unwrap()
+                .data("etc", b"a file first", None)
+                .unwrap()
+                .empty_directory("etc", 0o755, 0, 0)
+                .unwrap()
+                .build()
+                .await
+                .unwrap(),
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"base"
         );
     }
 

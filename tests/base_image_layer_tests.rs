@@ -4,9 +4,9 @@ use ocipkg::image::{Image as _, OciArtifact};
 use std::io::Read;
 use tempfile::tempdir;
 
-/// Keeps the base's entries except whatever holds id 1000 or the name `sandbox`, makes sure
-/// `root` exists, and appends `sandbox` at 1000. `id_field` is the passwd/group id column.
-fn merge_identity(base: &str, root_line: &str, sandbox_line: &str) -> String {
+/// Keeps the base's entries except whatever holds id 1000 or the name `app`, makes sure
+/// `root` exists, and appends `app` at 1000. `id_field` is the passwd/group id column.
+fn merge_identity(base: &str, root_line: &str, app_line: &str) -> String {
     let id_field = 2;
     let mut out = String::new();
     if !base.lines().any(|l| l.starts_with("root:")) {
@@ -15,13 +15,13 @@ fn merge_identity(base: &str, root_line: &str, sandbox_line: &str) -> String {
     }
     for line in base.lines().filter(|l| !l.is_empty()) {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.first() == Some(&"sandbox") || fields.get(id_field) == Some(&"1000") {
+        if fields.first() == Some(&"app") || fields.get(id_field) == Some(&"1000") {
             continue;
         }
         out.push_str(line);
         out.push('\n');
     }
-    out.push_str(sandbox_line);
+    out.push_str(app_line);
     out.push('\n');
     out
 }
@@ -62,10 +62,9 @@ fn top_layer_headers(image: &Image) -> Vec<(String, u64, u64, u32)> {
         .collect()
 }
 
-/// Reproduces, without running anything inside the base, a Dockerfile that copies a
-/// merged /etc/passwd and /etc/group, a root-owned binary and a 1000-owned 0700 directory
-/// onto a public base, then sets ENV, EXPOSE, USER and ENTRYPOINT. Needs network access
-/// to Docker Hub.
+/// Reproduces, without running anything inside the base, a Dockerfile that COPYs merged
+/// passwd/group files, a root-owned binary and a 1000-owned 0700 dir onto a public base,
+/// then sets ENV, EXPOSE, USER and ENTRYPOINT. Needs Docker Hub access.
 #[tokio::test]
 async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
     let cache_dir = tempdir().unwrap();
@@ -95,9 +94,9 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
     let passwd = merge_identity(
         &base_passwd,
         "root:x:0:0:root:/root:/sbin/nologin",
-        "sandbox:x:1000:1000::/sandbox:/sbin/nologin",
+        "app:x:1000:1000::/data:/sbin/nologin",
     );
-    let group = merge_identity(&base_group, "root:x:0:", "sandbox:x:1000:");
+    let group = merge_identity(&base_group, "root:x:0:", "app:x:1000:");
     let binary = b"#!/bin/sh\necho stand-in\n";
 
     let layer = Layer::builder()?
@@ -105,7 +104,7 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
         .data_with_owner("/etc/passwd", passwd.as_bytes(), 0o644, 0, 0)?
         .data_with_owner("/etc/group", group.as_bytes(), 0o644, 0, 0)?
         .data_with_owner("/usr/local/bin/app-agent", binary, 0o755, 0, 0)?
-        .empty_directory("/sandbox", 0o700, 1000, 1000)?
+        .empty_directory("/data", 0o700, 1000, 1000)?
         .build()
         .await?;
 
@@ -119,7 +118,7 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
         .platform("linux", &Arch::Amd64)
         .blob_cache(cache.clone())
         .layer(layer)
-        .env("APP_ROOT", "/sandbox")
+        .env("APP_ROOT", "/data")
         .env("APP_PORT", "8080")
         .expose_port("8080/tcp")
         .user("1000:1000")
@@ -155,7 +154,7 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
     let process = config.config().as_ref().unwrap();
     let env = process.env().clone().unwrap();
     assert!(env.contains(&base_path), "base PATH kept: {env:?}");
-    assert!(env.contains(&"APP_ROOT=/sandbox".to_string()), "{env:?}");
+    assert!(env.contains(&"APP_ROOT=/data".to_string()), "{env:?}");
     assert!(env.contains(&"APP_PORT=8080".to_string()), "{env:?}");
     assert_eq!(process.user().as_deref(), Some("1000:1000"));
     assert!(process
@@ -172,7 +171,7 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
     let pulled_passwd = String::from_utf8(pulled.read_file("/etc/passwd").await?.unwrap()).unwrap();
     assert_eq!(pulled_passwd, passwd);
     assert!(pulled_passwd.starts_with("root:x:0:0:"));
-    assert!(pulled_passwd.ends_with("sandbox:x:1000:1000::/sandbox:/sbin/nologin\n"));
+    assert!(pulled_passwd.ends_with("app:x:1000:1000::/data:/sbin/nologin\n"));
     for base_line in base_passwd.lines().filter(|l| !l.is_empty()) {
         assert!(
             pulled_passwd.contains(base_line),
@@ -180,10 +179,7 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
         );
     }
     let pulled_group = String::from_utf8(pulled.read_file("/etc/group").await?.unwrap()).unwrap();
-    assert!(
-        pulled_group.ends_with("sandbox:x:1000:\n"),
-        "{pulled_group}"
-    );
+    assert!(pulled_group.ends_with("app:x:1000:\n"), "{pulled_group}");
     assert_eq!(
         pulled.read_file("/usr/local/bin/app-agent").await?.unwrap(),
         binary
@@ -205,6 +201,6 @@ async fn layers_onto_a_public_base_with_owner_modes_and_config() -> Result<()> {
     assert_eq!(owner_mode("etc/passwd"), (0, 0, 0o644));
     assert_eq!(owner_mode("etc/group"), (0, 0, 0o644));
     assert_eq!(owner_mode("usr/local/bin/app-agent"), (0, 0, 0o755));
-    assert_eq!(owner_mode("sandbox"), (1000, 1000, 0o700));
+    assert_eq!(owner_mode("data"), (1000, 1000, 0o700));
     Ok(())
 }

@@ -375,7 +375,10 @@ impl Image {
         let target = normalize_layer_path(path.as_ref())
             .filter(|p| !p.as_os_str().is_empty())
             .ok_or_else(|| Error::InvalidPath {
-                message: format!("Cannot read '{}' as a file", path.as_ref().display()),
+                message: format!(
+                    "Cannot read '{}' as a file: the path is empty or contains '..'",
+                    path.as_ref().display()
+                ),
             })?;
         tokio::task::spawn_blocking(move || read_file_from_oci_archive(&archive_path, &target))
             .await
@@ -1722,9 +1725,23 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
             }
         };
 
+        let is_whiteout = file_name.starts_with(".wh.");
+        // Whiteouts delete instead of unpacking, so unpack_in's traversal guard never sees them.
+        let whiteout_path = match normalize_layer_path(&entry_path) {
+            Some(path) => path,
+            None if is_whiteout => {
+                warn!(
+                    path = %entry_path.display(),
+                    "Skipping whiteout: path escapes target directory"
+                );
+                continue;
+            }
+            None => entry_path.clone(),
+        };
+
         if file_name == ".wh..wh..opq" {
             // Opaque whiteout: delete all existing contents in the parent directory
-            let parent = target_dir.join(entry_path.parent().unwrap_or_else(|| Path::new("")));
+            let parent = target_dir.join(whiteout_path.parent().unwrap_or_else(|| Path::new("")));
             if parent.is_dir() {
                 for child in std_fs::read_dir(&parent)? {
                     let child = child?;
@@ -1739,7 +1756,7 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
         } else if let Some(target_name) = file_name.strip_prefix(".wh.") {
             // Regular whiteout: delete the specific file/directory
             let target_path = target_dir.join(
-                entry_path
+                whiteout_path
                     .parent()
                     .unwrap_or_else(|| Path::new(""))
                     .join(target_name),
@@ -1874,7 +1891,8 @@ fn lookup_in_layer<R: std::io::Read>(
 
     let mut hidden = false;
     let mut found: Option<(usize, std::result::Result<Vec<u8>, &'static str>)> = None;
-    let mut ancestors: HashMap<PathBuf, (usize, tar::EntryType)> = HashMap::new();
+    let mut ancestor_types: HashMap<PathBuf, tar::EntryType> = HashMap::new();
+    let mut last_ancestor_replaced: Option<usize> = None;
     for (index, entry_result) in archive.entries()?.enumerate() {
         let mut entry = entry_result?;
         let Some(entry_path) = normalize_layer_path(&entry.path()?) else {
@@ -1915,20 +1933,20 @@ fn lookup_in_layer<R: std::io::Read>(
             };
             found = Some((index, content));
         } else if !entry_path.as_os_str().is_empty() && target.starts_with(&entry_path) {
-            ancestors.insert(entry_path, (index, entry.header().entry_type()));
+            let entry_type = entry.header().entry_type();
+            // A non-directory removes the whole subtree, even if a directory is recreated later.
+            if entry_type != tar::EntryType::Directory {
+                last_ancestor_replaced = Some(index);
+            }
+            ancestor_types.insert(entry_path, entry_type);
         }
     }
-    if ancestors
+    if ancestor_types
         .values()
-        .any(|(_, t)| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
+        .any(|t| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
     {
         return Err(LookupError::NotRegular("an ancestor is a link"));
     }
-    let last_ancestor_replaced = ancestors
-        .values()
-        .filter(|(_, t)| *t != tar::EntryType::Directory)
-        .map(|(index, _)| *index)
-        .max();
     match found {
         Some((index, _)) if last_ancestor_replaced.is_some_and(|a| a > index) => {
             Ok(LayerLookup::Hidden)
@@ -2115,6 +2133,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_hides_a_file_whose_parent_is_replaced_then_recreated_in_one_layer() {
+        let empty = tempfile::tempdir().unwrap();
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            Layer::builder()
+                .unwrap()
+                .data("etc/passwd", b"upper", None)
+                .unwrap()
+                .data("etc", b"now a file", None)
+                .unwrap()
+                .directory(empty.path(), "etc")
+                .unwrap()
+                .build()
+                .await
+                .unwrap(),
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[test]
+    fn extraction_skips_a_whiteout_that_escapes_the_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("rootfs");
+        std_fs::create_dir(&target).unwrap();
+        let outside = root.path().join("keep");
+        std_fs::write(&outside, b"x").unwrap();
+
+        let mut tar_bytes = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        let name = b"../.wh.keep";
+        header.as_old_mut().name[..name.len()].copy_from_slice(name);
+        header.set_cksum();
+        tar_bytes.append(&header, &[][..]).unwrap();
+        let tar_bytes = tar_bytes.into_inner().unwrap();
+
+        extract_layer_with_whiteouts(tar::Archive::new(tar_bytes.as_slice()), &target).unwrap();
+        assert!(outside.exists());
+    }
+
+    #[tokio::test]
     async fn read_file_hides_a_file_whose_parent_is_replaced_later_in_its_layer() {
         let img = image(vec![
             layer(&[("etc/passwd", b"base")]).await,
@@ -2159,27 +2221,6 @@ mod tests {
                 "key {key:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn read_file_takes_the_last_entry_for_an_ancestor_within_a_layer() {
-        let img = image(vec![
-            layer(&[("etc/passwd", b"base")]).await,
-            Layer::builder()
-                .unwrap()
-                .data("etc", b"a file first", None)
-                .unwrap()
-                .empty_directory("etc", 0o755, 0, 0)
-                .unwrap()
-                .build()
-                .await
-                .unwrap(),
-        ])
-        .await;
-        assert_eq!(
-            img.read_file("/etc/passwd").await.unwrap().unwrap(),
-            b"base"
-        );
     }
 
     #[test]

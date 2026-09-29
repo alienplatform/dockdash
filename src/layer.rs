@@ -436,8 +436,8 @@ impl LayerBuilder {
     /// - `uid`, `gid`: Numeric owner written into the tar header.
     ///
     /// Missing parent directories are added as root-owned `0o755`, as for files, and files
-    /// added under this path later reuse this entry. Fails if this layer already has a
-    /// directory entry at this path, such as the implicit one added for an earlier file.
+    /// added under this path later reuse this entry. Fails if this layer already has an
+    /// entry at or under this path, since the entry order would then change the layer.
     #[instrument(level = "info", skip(self), fields(archive_path = %archive_path.as_ref().display(), mode, uid, gid))]
     pub fn empty_directory(
         mut self,
@@ -454,7 +454,12 @@ impl LayerBuilder {
             });
         }
 
-        if self.created_archive_dirs.contains(&normalized_ap) {
+        if self.created_archive_dirs.contains(&normalized_ap)
+            || self
+                .file_metadata
+                .iter()
+                .any(|m| m.archive_path.starts_with(&normalized_ap))
+        {
             return Err(Error::InvalidPath {
                 message: format!(
                     "Directory {} already has an entry in this layer; add it before any entry under it",
@@ -1783,6 +1788,12 @@ mod tests {
         let result = Layer::builder()?
             .empty_directory("workspace", 0o700, 1000, 1000)?
             .empty_directory("workspace", 0o755, 0, 0);
+        assert!(matches!(result, Err(Error::InvalidPath { .. })));
+        let source = tempdir().unwrap();
+        std::fs::write(source.path().join("f"), b"x").unwrap();
+        let result = Layer::builder()?
+            .directory(source.path(), "workspace")?
+            .empty_directory("workspace", 0o700, 1000, 1000);
         assert!(matches!(result, Err(Error::InvalidPath { .. })));
         Ok(())
     }

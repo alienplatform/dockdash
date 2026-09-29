@@ -48,3 +48,11 @@ tokio = { version = "1.48", features = ["full", "test-util"] }
 [features]
 default = []
 test-utils = ["dep:container-registry"]
+
+[[test]]
+name = "base_image_layer_tests"
+required-features = ["test-utils"]
+
+[[test]]
+name = "build_push_tests"
+required-features = ["test-utils"]

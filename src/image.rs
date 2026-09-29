@@ -372,12 +372,11 @@ impl Image {
     #[instrument(skip(self), fields(image_path = %self.oci_archive_path.display(), path = %path.as_ref().display()))]
     pub async fn read_file(&self, path: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
         let archive_path = self.oci_archive_path.clone();
-        let target = normalize_layer_path(path.as_ref());
-        if target.as_os_str().is_empty() {
-            return Err(Error::InvalidPath {
+        let target = normalize_layer_path(path.as_ref())
+            .filter(|p| !p.as_os_str().is_empty())
+            .ok_or_else(|| Error::InvalidPath {
                 message: format!("Cannot read '{}' as a file", path.as_ref().display()),
-            });
-        }
+            })?;
         tokio::task::spawn_blocking(move || read_file_from_oci_archive(&archive_path, &target))
             .await
             .map_err(|e| Error::Join {
@@ -1770,10 +1769,17 @@ fn extract_layer_with_whiteouts<R: std::io::Read>(
 }
 
 /// Strips `./`, a leading `/` and a trailing `/` so tar entry paths compare equal.
-fn normalize_layer_path(path: &Path) -> PathBuf {
-    path.components()
-        .filter(|c| matches!(c, std::path::Component::Normal(_)))
-        .collect()
+/// `None` for a path with a `..` component, which extraction refuses to unpack.
+fn normalize_layer_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => return None,
+            _ => {}
+        }
+    }
+    Some(normalized)
 }
 
 /// What one layer says about the file being looked up.
@@ -1867,11 +1873,13 @@ fn lookup_in_layer<R: std::io::Read>(
     use std::io::Read as _;
 
     let mut hidden = false;
-    let mut found: Option<std::result::Result<Vec<u8>, &'static str>> = None;
-    let mut ancestors: HashMap<PathBuf, tar::EntryType> = HashMap::new();
-    for entry_result in archive.entries()? {
+    let mut found: Option<(usize, std::result::Result<Vec<u8>, &'static str>)> = None;
+    let mut ancestors: HashMap<PathBuf, (usize, tar::EntryType)> = HashMap::new();
+    for (index, entry_result) in archive.entries()?.enumerate() {
         let mut entry = entry_result?;
-        let entry_path = normalize_layer_path(&entry.path()?);
+        let Some(entry_path) = normalize_layer_path(&entry.path()?) else {
+            continue;
+        };
         let file_name = entry_path
             .file_name()
             .map(|n| n.as_encoded_bytes())
@@ -1893,7 +1901,7 @@ fn lookup_in_layer<R: std::io::Read>(
             }
         } else if entry_path == target {
             let entry_type = entry.header().entry_type();
-            found = Some(if entry_type.is_file() {
+            let content = if entry_type.is_file() {
                 let mut content = Vec::new();
                 entry.read_to_end(&mut content)?;
                 Ok(content)
@@ -1904,24 +1912,30 @@ fn lookup_in_layer<R: std::io::Read>(
                     tar::EntryType::Link => "hard link",
                     _ => "special file",
                 })
-            });
+            };
+            found = Some((index, content));
         } else if !entry_path.as_os_str().is_empty() && target.starts_with(&entry_path) {
-            ancestors.insert(entry_path, entry.header().entry_type());
+            ancestors.insert(entry_path, (index, entry.header().entry_type()));
         }
     }
     if ancestors
         .values()
-        .any(|t| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
+        .any(|(_, t)| matches!(t, tar::EntryType::Symlink | tar::EntryType::Link))
     {
         return Err(LookupError::NotRegular("an ancestor is a link"));
     }
-    if ancestors.values().any(|t| *t != tar::EntryType::Directory) {
-        hidden = true;
-    }
+    let last_ancestor_replaced = ancestors
+        .values()
+        .filter(|(_, t)| *t != tar::EntryType::Directory)
+        .map(|(index, _)| *index)
+        .max();
     match found {
-        Some(Ok(content)) => Ok(LayerLookup::Found(content)),
-        Some(Err(kind)) => Err(LookupError::NotRegular(kind)),
-        None if hidden => Ok(LayerLookup::Hidden),
+        Some((index, _)) if last_ancestor_replaced.is_some_and(|a| a > index) => {
+            Ok(LayerLookup::Hidden)
+        }
+        Some((_, Ok(content))) => Ok(LayerLookup::Found(content)),
+        Some((_, Err(kind))) => Err(LookupError::NotRegular(kind)),
+        None if hidden || last_ancestor_replaced.is_some() => Ok(LayerLookup::Hidden),
         None => Ok(LayerLookup::Absent),
     }
 }
@@ -2094,6 +2108,20 @@ mod tests {
             img.read_file("/").await,
             Err(Error::InvalidPath { .. })
         ));
+        assert!(matches!(
+            img.read_file("/tmp/../etc/passwd").await,
+            Err(Error::InvalidPath { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_file_hides_a_file_whose_parent_is_replaced_later_in_its_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/passwd", b"upper"), ("etc", b"now a file")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
     }
 
     #[tokio::test]

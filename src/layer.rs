@@ -435,9 +435,9 @@ impl LayerBuilder {
     /// - `mode`: The directory mode (e.g. `0o700`).
     /// - `uid`, `gid`: Numeric owner written into the tar header.
     ///
-    /// Missing parent directories are added as root-owned `0o755`, as for files. Files added
-    /// under this path later reuse this entry. If files were added under it first, their
-    /// implicit root-owned entry precedes this one, and this later entry wins on extraction.
+    /// Missing parent directories are added as root-owned `0o755`, as for files, and files
+    /// added under this path later reuse this entry. Fails if this layer already has a
+    /// directory entry at this path, such as the implicit one added for an earlier file.
     #[instrument(level = "info", skip(self), fields(archive_path = %archive_path.as_ref().display(), mode, uid, gid))]
     pub fn empty_directory(
         mut self,
@@ -451,6 +451,15 @@ impl LayerBuilder {
             return Err(Error::InvalidPath {
                 message: "Archive path for a directory entry cannot be the root directory ('/') or empty."
                     .to_string(),
+            });
+        }
+
+        if self.created_archive_dirs.contains(&normalized_ap) {
+            return Err(Error::InvalidPath {
+                message: format!(
+                    "Directory {} already has an entry in this layer; add it before any entry under it",
+                    normalized_ap.display()
+                ),
             });
         }
 
@@ -1762,6 +1771,19 @@ mod tests {
             .build()
             .await?;
         assert_ne!(dir_root.diff_id(), dir_user.diff_id());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_empty_directory_after_an_entry_under_it_error() -> Result<()> {
+        let result = Layer::builder()?
+            .data("workspace/file", b"x", None)?
+            .empty_directory("workspace", 0o700, 1000, 1000);
+        assert!(matches!(result, Err(Error::InvalidPath { .. })));
+        let result = Layer::builder()?
+            .empty_directory("workspace", 0o700, 1000, 1000)?
+            .empty_directory("workspace", 0o755, 0, 0);
+        assert!(matches!(result, Err(Error::InvalidPath { .. })));
         Ok(())
     }
 

@@ -1098,7 +1098,9 @@ impl ImageBuilder {
             .find(|(k, _)| k.is_empty() || k.contains('='))
         {
             return Err(Error::ImageConfig {
-                message: format!("Invalid environment variable name '{key}'"),
+                message: format!(
+                    "Invalid environment variable name '{key}': it must be non-empty and must not contain '='"
+                ),
                 source: None,
             });
         }
@@ -2079,10 +2081,6 @@ mod tests {
         ])
         .await;
         assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
-        assert!(matches!(
-            img.read_file("/").await,
-            Err(Error::InvalidPath { .. })
-        ));
     }
 
     #[tokio::test]
@@ -2090,6 +2088,10 @@ mod tests {
         let img = image(vec![layer(&[("etc/passwd", b"x")]).await]).await;
         assert!(matches!(
             img.read_file("/etc").await,
+            Err(Error::InvalidPath { .. })
+        ));
+        assert!(matches!(
+            img.read_file("/").await,
             Err(Error::InvalidPath { .. })
         ));
     }

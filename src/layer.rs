@@ -67,7 +67,7 @@ struct FileMetadata {
     is_dir: bool,
     /// Optional content hash for in-memory data (where mtime is meaningless)
     content_hash: Option<[u8; 32]>,
-    /// Explicit uid/gid; hashed only when set so existing cache keys stay stable.
+    /// Explicit uid/gid; hashed only when set, so entries without an owner keep their key.
     owner: Option<(u64, u64)>,
 }
 

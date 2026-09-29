@@ -1843,8 +1843,9 @@ impl From<std::io::Error> for LookupError {
     }
 }
 
-/// Scans a whole layer before deciding, because a whiteout may come after the entry it
-/// would hide in a lower layer, and never hides an entry in its own layer.
+/// Scans a whole layer before deciding: a whiteout may come after the entry it would hide
+/// in a lower layer and never hides an entry in its own layer, and when a path repeats in
+/// one layer the last entry wins, as on extraction.
 fn lookup_in_layer<R: std::io::Read>(
     mut archive: tar::Archive<R>,
     target: &Path,
@@ -1852,6 +1853,7 @@ fn lookup_in_layer<R: std::io::Read>(
     use std::io::Read as _;
 
     let mut hidden = false;
+    let mut found: Option<std::result::Result<Vec<u8>, &'static str>> = None;
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_path = normalize_layer_path(&entry.path()?);
@@ -1871,17 +1873,18 @@ fn lookup_in_layer<R: std::io::Read>(
             }
         } else if entry_path == target {
             let entry_type = entry.header().entry_type();
-            if entry_type.is_file() {
+            found = Some(if entry_type.is_file() {
                 let mut content = Vec::new();
                 entry.read_to_end(&mut content)?;
-                return Ok(LayerLookup::Found(content));
-            }
-            return Err(LookupError::NotRegular(match entry_type {
-                tar::EntryType::Directory => "directory",
-                tar::EntryType::Symlink => "symlink",
-                tar::EntryType::Link => "hard link",
-                _ => "special file",
-            }));
+                Ok(content)
+            } else {
+                Err(match entry_type {
+                    tar::EntryType::Directory => "directory",
+                    tar::EntryType::Symlink => "symlink",
+                    tar::EntryType::Link => "hard link",
+                    _ => "special file",
+                })
+            });
         } else if !entry_path.as_os_str().is_empty() && target.starts_with(&entry_path) {
             match entry.header().entry_type() {
                 tar::EntryType::Directory => {}
@@ -1892,11 +1895,12 @@ fn lookup_in_layer<R: std::io::Read>(
             }
         }
     }
-    Ok(if hidden {
-        LayerLookup::Hidden
-    } else {
-        LayerLookup::Absent
-    })
+    match found {
+        Some(Ok(content)) => Ok(LayerLookup::Found(content)),
+        Some(Err(kind)) => Err(LookupError::NotRegular(kind)),
+        None if hidden => Ok(LayerLookup::Hidden),
+        None => Ok(LayerLookup::Absent),
+    }
 }
 
 /// Checks if a registry requires monolithic push based on its hostname.
@@ -1997,6 +2001,64 @@ mod tests {
             same_layer.read_file("/etc/passwd").await.unwrap().unwrap(),
             b"kept"
         );
+    }
+
+    #[tokio::test]
+    async fn read_file_takes_the_last_copy_within_a_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/passwd", b"first"), ("etc/passwd", b"second")]).await,
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"second"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_treats_an_ancestor_replaced_by_a_file_as_hiding_the_lower_file() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc", b"now a file")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_ignores_whiteouts_for_a_name_prefix() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[("etc/.wh.pass", b""), ("etcx/.wh..wh..opq", b"")]).await,
+        ])
+        .await;
+        assert_eq!(
+            img.read_file("/etc/passwd").await.unwrap().unwrap(),
+            b"base"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_keeps_only_new_entries_of_a_parent_whited_out_and_recreated_in_one_layer() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base"), ("etc/group", b"g")]).await,
+            layer(&[(".wh.etc", b""), ("etc/passwd", b"new")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap().unwrap(), b"new");
+        assert_eq!(img.read_file("/etc/group").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn read_file_hides_every_lower_file_under_a_root_opaque_marker() {
+        let img = image(vec![
+            layer(&[("etc/passwd", b"base")]).await,
+            layer(&[(".wh..wh..opq", b""), ("x", b"x")]).await,
+        ])
+        .await;
+        assert_eq!(img.read_file("/etc/passwd").await.unwrap(), None);
+        assert!(img.read_file("/").await.is_err());
     }
 
     #[tokio::test]

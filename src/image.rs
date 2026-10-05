@@ -68,6 +68,8 @@ pub struct PushProgressInfo {
 }
 
 /// Trait for receiving progress updates during image push operations
+// async-trait marks its boxed Future must_use; Future already carries that annotation.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PushProgressCallback: Send + Sync {
     /// Called when progress is updated

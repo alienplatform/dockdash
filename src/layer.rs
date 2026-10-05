@@ -13,9 +13,35 @@ use tracing::{debug, info, instrument, warn};
 
 use crate::IMAGE_LAYER_ZSTD_MEDIA_TYPE;
 
+/// Compression used for newly built OCI layers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LayerCompression {
+    /// Zstandard compression (the default).
+    #[default]
+    Zstd,
+    /// Gzip compression, supported by runtimes such as AWS Lambda.
+    Gzip,
+}
+
+impl LayerCompression {
+    fn media_type(self) -> &'static str {
+        match self {
+            Self::Zstd => IMAGE_LAYER_ZSTD_MEDIA_TYPE,
+            Self::Gzip => "application/vnd.oci.image.layer.v1.tar+gzip",
+        }
+    }
+
+    fn cache_key(self, key: String) -> String {
+        match self {
+            Self::Zstd => key,
+            Self::Gzip => format!("{key}-gzip-v1"),
+        }
+    }
+}
+
 /// Represents a single layer in an OCI image.
 ///
-/// A layer consists of a zstd-compressed tarball of files and a corresponding diff_id.
+/// A layer consists of a compressed tarball of files and a corresponding diff_id.
 /// The temporary file holding the compressed tarball is automatically deleted when
 /// the `Layer` instance is dropped.
 pub struct Layer {
@@ -75,9 +101,10 @@ struct FileMetadata {
 ///
 /// Allows for incrementally adding content (directories, files, in-memory data)
 /// to an uncompressed tar archive stored in a temporary file. The `build` method
-/// finalizes this tar archive, computes its diff_id, zstd-compresses it into another
+/// finalizes this tar archive, computes its diff_id, compresses it into another
 /// temporary file, and returns a `Layer`.
 pub struct LayerBuilder {
+    compression: LayerCompression,
     /// Kept alive so the temp file isn't deleted while the tar builder writes to it.
     _uncompressed_tar_tmpfile: NamedTempFile,
     tar_writer: tar::Builder<File>,
@@ -115,6 +142,7 @@ impl LayerBuilder {
         );
         debug!(path = %uncompressed_tar_path.display(), "LayerBuilder initialized with temporary tar file.");
         Ok(Self {
+            compression: LayerCompression::default(),
             _uncompressed_tar_tmpfile: uncompressed_tar_tmpfile,
             tar_writer,
             uncompressed_tar_path,
@@ -128,6 +156,12 @@ impl LayerBuilder {
     /// If not called, a default BlobCache will be created when `build()` is invoked.
     pub fn blob_cache(mut self, cache: blobcache::BlobCache) -> Self {
         self.blob_cache = Some(cache);
+        self
+    }
+
+    /// Select the compression format for this layer.
+    pub fn compression(mut self, compression: LayerCompression) -> Self {
+        self.compression = compression;
         self
     }
 
@@ -574,7 +608,7 @@ impl LayerBuilder {
     /// Finalizes the layer construction.
     ///
     /// This method completes the uncompressed tar archive, calculates its diff_id (SHA256 hash),
-    /// zstd-compresses the archive into a new temporary file, and returns the resulting `Layer`.
+    /// compresses the archive into a new temporary file, and returns the resulting `Layer`.
     /// This is an asynchronous operation due to potentially blocking I/O for hashing and compression.
     #[instrument(level = "info", skip_all, fields(uncompressed_tar_path = %self.uncompressed_tar_path.display()))]
     pub async fn build(mut self) -> Result<Layer> {
@@ -588,7 +622,8 @@ impl LayerBuilder {
 
         // Try input-based cache key FIRST (before finalizing tar)
         // This is much faster than hashing tar content for large binaries
-        let input_key = self.calculate_input_key();
+        let compression = self.compression;
+        let input_key = compression.cache_key(self.calculate_input_key());
         debug!(input_key = %input_key, "Calculated layer input key from file metadata");
         if let Some(cached_metadata) = cache.get_blob(&input_key).await? {
             if let Ok(metadata_str) = std::str::from_utf8(&cached_metadata) {
@@ -622,7 +657,7 @@ impl LayerBuilder {
                             return Ok(Layer {
                                 diff_id: diff_id.to_string(),
                                 blob_digest: blob_digest.to_string(),
-                                media_type: IMAGE_LAYER_ZSTD_MEDIA_TYPE.to_string(),
+                                media_type: compression.media_type().to_string(),
                                 compressed_layer_file,
                             });
                         }
@@ -654,7 +689,8 @@ impl LayerBuilder {
         debug!("Uncompressed tar finalized and synced.");
 
         // Calculate content-based cache key from the uncompressed tar
-        let content_key = Self::calculate_content_key(&self.uncompressed_tar_path)?;
+        let content_key =
+            compression.cache_key(Self::calculate_content_key(&self.uncompressed_tar_path)?);
         debug!(content_key = %content_key, "Calculated layer content key");
 
         // Check if we have a cached blob for this content
@@ -693,7 +729,7 @@ impl LayerBuilder {
                             return Ok(Layer {
                                 diff_id: diff_id.to_string(),
                                 blob_digest: blob_digest.to_string(),
-                                media_type: IMAGE_LAYER_ZSTD_MEDIA_TYPE.to_string(),
+                                media_type: compression.media_type().to_string(),
                                 compressed_layer_file,
                             });
                         }
@@ -742,7 +778,7 @@ impl LayerBuilder {
         })??; // Outer Result for JoinError, inner Result for hashing logic
         info!(diff_id = %format!("sha256:{}", diff_id_hex), "Calculated diff_id.");
 
-        // Compress the uncompressed tar with zstd into a new temporary file
+        // Compress the uncompressed tar with the selected format into a new temporary file
         let compressed_layer_file = NamedTempFile::new().map_err(|e| {
             warn!(error = %e, "Failed to create temporary file for compressed layer.");
             Error::Io {
@@ -753,15 +789,15 @@ impl LayerBuilder {
         debug!(compressed_layer_path = %compressed_layer_file.path().display(), "Created temporary file for compressed layer.");
 
         let compressed_writer_file_reopened = compressed_layer_file.reopen().map_err(|e| {
-            warn!(error = %e, "Compression: Failed to reopen temporary file for zstd writer.");
+            warn!(error = %e, "Compression: Failed to reopen temporary file for compression writer.");
             Error::Io {
                 source: e,
-                message: "Compression: Failed to reopen temporary file for zstd writer".to_string(),
+                message: "Compression: Failed to reopen temporary file for compression writer".to_string(),
             }
         })?;
 
         let path_for_compressing = self.uncompressed_tar_path.clone(); // path to uncompressed tar
-        info!(source_path = %path_for_compressing.display(), dest_path = %compressed_layer_file.path().display(), "Compressing uncompressed tar with zstd.");
+        info!(source_path = %path_for_compressing.display(), dest_path = %compressed_layer_file.path().display(), "Compressing uncompressed tar.");
         task::spawn_blocking(move || -> Result<()> {
             let mut uncompressed_reader =
                 File::open(&path_for_compressing).map_err(|e| {
@@ -774,27 +810,27 @@ impl LayerBuilder {
                         ),
                     }
                 })?;
-            // Use zstd compression level 3 for good balance of speed and compression
-            let mut zstd_encoder = zstd::Encoder::new(compressed_writer_file_reopened, 3).map_err(|e| {
-                warn!(error = %e, "Failed to create zstd encoder.");
-                Error::Io {
-                    source: e,
-                    message: "Failed to create zstd encoder".to_string(),
+            let compress = || -> io::Result<()> {
+                match compression {
+                    LayerCompression::Zstd => {
+                        let mut encoder = zstd::Encoder::new(compressed_writer_file_reopened, 3)?;
+                        io::copy(&mut uncompressed_reader, &mut encoder)?;
+                        encoder.finish()?;
+                    }
+                    LayerCompression::Gzip => {
+                        let mut encoder = flate2::write::GzEncoder::new(
+                            compressed_writer_file_reopened,
+                            flate2::Compression::default(),
+                        );
+                        io::copy(&mut uncompressed_reader, &mut encoder)?;
+                        encoder.finish()?;
+                    }
                 }
-            })?;
-            io::copy(&mut uncompressed_reader, &mut zstd_encoder).map_err(|e| {
-                warn!(error = %e, "Failed to compress tar data with zstd.");
-                Error::Io {
-                    source: e,
-                    message: "Failed to compress tar data with zstd".to_string(),
-                }
-            })?;
-            zstd_encoder.finish().map_err(|e| {
-                warn!(error = %e, "Failed to finalize zstd stream.");
-                Error::Io {
-                    source: e,
-                    message: "Failed to finalize zstd stream".to_string(),
-                }
+                Ok(())
+            };
+            compress().map_err(|source| Error::Io {
+                source,
+                message: format!("Failed to compress layer with {compression:?}"),
             })?;
             Result::Ok(())
         })
@@ -854,7 +890,7 @@ impl LayerBuilder {
         Ok(Layer {
             diff_id: format!("sha256:{}", diff_id_hex),
             blob_digest: blob_digest_sha256,
-            media_type: IMAGE_LAYER_ZSTD_MEDIA_TYPE.to_string(),
+            media_type: compression.media_type().to_string(),
             compressed_layer_file,
         })
     }
@@ -955,6 +991,61 @@ mod tests {
     use std::{fs, io::Read as _};
     use tar::Archive;
     use tempfile::tempdir;
+
+    #[tokio::test]
+    async fn compression_formats_do_not_share_cached_blobs() {
+        let cache_dir = tempdir().unwrap();
+        let cache = blobcache::BlobCache::with_path(cache_dir.path().to_path_buf()).unwrap();
+        let mut zstd_digest = None;
+        let mut gzip_digest = None;
+        // Repeat both formats to exercise the input-cache hit, after populating
+        // the same cache with identical content in the other format.
+        for compression in [
+            LayerCompression::Zstd,
+            LayerCompression::Gzip,
+            LayerCompression::Zstd,
+            LayerCompression::Gzip,
+        ] {
+            let layer = Layer::builder()
+                .unwrap()
+                .blob_cache(cache.clone())
+                .compression(compression)
+                .data("payload", b"hello lambda", Some(0o644))
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            assert_eq!(layer.media_type(), compression.media_type());
+            let file = File::open(layer.path()).unwrap();
+            let mut reader: Box<dyn std::io::Read> = match compression {
+                LayerCompression::Zstd => Box::new(zstd::Decoder::new(file).unwrap()),
+                LayerCompression::Gzip => Box::new(flate2::read::GzDecoder::new(file)),
+            };
+            let mut tar_bytes = Vec::new();
+            reader.read_to_end(&mut tar_bytes).unwrap();
+            assert_eq!(
+                layer.diff_id(),
+                format!("sha256:{:x}", Sha256::digest(&tar_bytes))
+            );
+            let mut archive = Archive::new(tar_bytes.as_slice());
+            let mut entries = archive.entries().unwrap();
+            let mut entry = entries.next().unwrap().unwrap();
+            assert_eq!(entry.path().unwrap().as_ref(), Path::new("payload"));
+            let mut contents = Vec::new();
+            entry.read_to_end(&mut contents).unwrap();
+            assert_eq!(contents, b"hello lambda");
+            let digest = match compression {
+                LayerCompression::Zstd => &mut zstd_digest,
+                LayerCompression::Gzip => &mut gzip_digest,
+            };
+            if let Some(previous) = digest {
+                assert_eq!(previous, layer.blob_digest());
+            } else {
+                *digest = Some(layer.blob_digest().to_string());
+            }
+        }
+        assert_ne!(zstd_digest, gzip_digest);
+    }
 
     // Helper to extract tar content for verification
     fn list_tar_contents(layer_path: &Path) -> Result<std::collections::HashMap<String, String>> {

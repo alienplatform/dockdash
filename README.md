@@ -28,6 +28,28 @@ It's fast enough to run inside a serverless function: build an image in a Lambda
 - 📦 **Push to any OCI registry** — Docker Hub, ECR, GCR, ACR, GHCR, or your own. Anonymous, basic auth, and token auth supported.
 - ⚡ **Incremental builds** — local content-addressable cache means unchanged layers are reused instantly.
 
+## Layer compression
+
+New layers use zstd by default. For runtimes that require gzip, such as AWS Lambda,
+select gzip when building each application layer:
+
+```rust
+use dockdash::{Layer, LayerCompression};
+
+# async fn example() -> dockdash::Result<()> {
+let layer = Layer::builder()?
+    .compression(LayerCompression::Gzip)
+    .file("./app", "/app", Some(0o755))?
+    .build()
+    .await?;
+# Ok(())
+# }
+```
+
+The image manifest preserves each layer's compression format. Gzip and zstd layers
+have separate cache entries. Existing base-image layers retain their original
+compression, so choose a compatible base image as well.
+
 ## Quick Start
 
 Add to your `Cargo.toml`:

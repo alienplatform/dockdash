@@ -14,7 +14,6 @@ use oci_client::{
     Reference, RegistryOperation,
 };
 
-use crate::IMAGE_LAYER_ZSTD_MEDIA_TYPE;
 use oci_spec::image::Arch;
 use oci_spec::image::{ImageConfiguration, ImageManifest as SpecImageManifest};
 use ocipkg::image::Image as _;
@@ -1559,7 +1558,7 @@ impl ImageBuilder {
         for new_layer in &self.layers {
             oci_tar_builder.add_layer_with_media_type(
                 &new_layer.path().to_path_buf(),
-                IMAGE_LAYER_ZSTD_MEDIA_TYPE.to_string(),
+                new_layer.media_type().to_string(),
             );
         }
 
@@ -2031,6 +2030,23 @@ mod tests {
         let mut archive = OciArtifact::from_oci_archive(image.path()).unwrap();
         let (_, bytes) = archive.get_config().unwrap();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn gzip_layer_round_trips_through_image_manifest() {
+        let layer = Layer::builder()
+            .unwrap()
+            .compression(crate::LayerCompression::Gzip)
+            .data("payload", b"gzip payload", Some(0o644))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let img = image(vec![layer]).await;
+        assert_eq!(
+            img.read_file("payload").await.unwrap().unwrap(),
+            b"gzip payload"
+        );
     }
 
     #[tokio::test]

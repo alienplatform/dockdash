@@ -1009,15 +1009,15 @@ fn write_pulled_archive(
         source,
     })?;
     let mut archive = tar::Builder::new(file);
-    let manifest_json: serde_json::Value =
-        serde_json::from_slice(manifest).map_err(|source| Error::ImageConfig {
-            message: "Parse pulled manifest".to_string(),
-            source: Some(Box::new(source)),
-        })?;
+    let media_type = base
+        .manifest
+        .as_ref()
+        .and_then(|manifest| manifest.media_type.as_deref())
+        .unwrap_or(oci_client::manifest::OCI_IMAGE_MEDIA_TYPE);
     let index = serde_json::json!({
         "schemaVersion": 2,
         "manifests": [{
-            "mediaType": manifest_json["mediaType"],
+            "mediaType": media_type,
             "digest": diagnostics.resolved_manifest_digest,
             "size": manifest.len(),
             "annotations": {
@@ -1442,9 +1442,15 @@ impl ImageBuilder {
                 // A pull is a transfer, not an image build. Retain the exact bytes:
                 // JSON serialization, even of equivalent metadata, changes image identity.
                 let raw_cache_key = format!("raw-manifest:{resolved_manifest_digest_str_temp}");
-                let raw = match cache.get_blob(&raw_cache_key).await? {
-                    Some(raw) => raw,
-                    None => {
+                let cached = cache.get_blob(&raw_cache_key).await?;
+                let raw = match cached {
+                    Some(raw)
+                        if format!("sha256:{:x}", Sha256::digest(&raw))
+                            == resolved_manifest_digest_str_temp =>
+                    {
+                        raw
+                    }
+                    _ => {
                         let digest_ref = Reference::with_digest(
                             base_ref.registry().to_string(),
                             base_ref.repository().to_string(),
@@ -1461,7 +1467,6 @@ impl ImageBuilder {
                             )
                             .await
                             .map_err(pull_err_mapper)?;
-                        cache.put_blob(&raw_cache_key, &raw).await?;
                         raw
                     }
                 };
@@ -1473,6 +1478,7 @@ impl ImageBuilder {
                         source: None,
                     });
                 }
+                cache.put_blob(&raw_cache_key, &raw).await?;
                 original_manifest = Some(raw);
             }
 

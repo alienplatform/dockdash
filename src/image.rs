@@ -975,6 +975,114 @@ pub struct ImageBuilder {
     protocol: ClientProtocol,
 }
 
+/// Write an OCI layout without rewriting content-addressed registry blobs.
+fn write_pulled_archive(
+    base: &OciImageData,
+    manifest: &[u8],
+    output: Option<PathBuf>,
+    name: String,
+    diagnostics: BuildDiagnostics,
+) -> Result<(Image, BuildDiagnostics)> {
+    let temp_dir = if output.is_none() {
+        Some(tempfile::tempdir().map_err(|source| Error::Io {
+            message: "Create pulled image directory".to_string(),
+            source,
+        })?)
+    } else {
+        None
+    };
+    let path = output.unwrap_or_else(|| {
+        temp_dir
+            .as_ref()
+            .expect("temporary output")
+            .path()
+            .join("image.oci.tar")
+    });
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std_fs::create_dir_all(parent).map_err(|source| Error::Io {
+            message: "Create pulled image output directory".to_string(),
+            source,
+        })?;
+    }
+    let file = std_fs::File::create(&path).map_err(|source| Error::Io {
+        message: "Create pulled image archive".to_string(),
+        source,
+    })?;
+    let mut archive = tar::Builder::new(file);
+    let manifest_json: serde_json::Value =
+        serde_json::from_slice(manifest).map_err(|source| Error::ImageConfig {
+            message: "Parse pulled manifest".to_string(),
+            source: Some(Box::new(source)),
+        })?;
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "manifests": [{
+            "mediaType": manifest_json["mediaType"],
+            "digest": diagnostics.resolved_manifest_digest,
+            "size": manifest.len(),
+            "annotations": {
+                "org.opencontainers.image.ref.name": name,
+                "io.containerd.image.name": name,
+            }
+        }]
+    });
+    let index_bytes = serde_json::to_vec(&index).map_err(|source| Error::ImageConfig {
+        message: "Serialize pulled image index".to_string(),
+        source: Some(Box::new(source)),
+    })?;
+    append_pulled_blob(
+        &mut archive,
+        "oci-layout",
+        br#"{"imageLayoutVersion":"1.0.0"}"#,
+    )?;
+    append_pulled_blob(&mut archive, "index.json", &index_bytes)?;
+    let manifest_digest = format!("{:x}", Sha256::digest(manifest));
+    append_pulled_blob(
+        &mut archive,
+        &format!("blobs/sha256/{manifest_digest}"),
+        manifest,
+    )?;
+    let config_digest = format!("{:x}", Sha256::digest(&base.config.data));
+    append_pulled_blob(
+        &mut archive,
+        &format!("blobs/sha256/{config_digest}"),
+        &base.config.data,
+    )?;
+    for layer in &base.layers {
+        let digest = format!("{:x}", Sha256::digest(&layer.data));
+        append_pulled_blob(&mut archive, &format!("blobs/sha256/{digest}"), &layer.data)?;
+    }
+    archive.finish().map_err(|source| Error::Io {
+        message: "Finish pulled image archive".to_string(),
+        source,
+    })?;
+    Ok((
+        Image {
+            oci_archive_path: path,
+            config_digest: format!("sha256:{config_digest}"),
+            _temp_dir_manager: temp_dir,
+        },
+        diagnostics,
+    ))
+}
+
+fn append_pulled_blob(
+    archive: &mut tar::Builder<std_fs::File>,
+    path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, bytes)
+        .map_err(|source| Error::Io {
+            message: format!("Write pulled image archive entry {path}"),
+            source,
+        })
+}
+
 impl ImageBuilder {
     /// Sets the base image reference (e.g., "marketplace.gcr.io/google/ubuntu2404:latest", "ghcr.io/user/image:tag").
     pub fn from(mut self, base_image_ref: &str) -> Self {
@@ -1094,6 +1202,14 @@ impl ImageBuilder {
     ))]
     pub async fn build(mut self) -> Result<(Image, BuildDiagnostics)> {
         info!("Starting image build.");
+        let pull_only = self.layers.is_empty()
+            && self.entrypoint.is_none()
+            && self.cmd.is_none()
+            && self.working_dir.is_none()
+            && self.env.is_empty()
+            && self.user.is_none()
+            && self.exposed_ports.is_empty();
+        let mut original_manifest = None;
 
         if let Some((key, _)) = self
             .env
@@ -1322,6 +1438,44 @@ impl ImageBuilder {
 
             info!(manifest_digest = %resolved_manifest_digest_str_temp, "Successfully obtained base ImageManifest (source: {:?}).", manifest_source_temp);
 
+            if pull_only {
+                // A pull is a transfer, not an image build. Retain the exact bytes:
+                // JSON serialization, even of equivalent metadata, changes image identity.
+                let raw_cache_key = format!("raw-manifest:{resolved_manifest_digest_str_temp}");
+                let raw = match cache.get_blob(&raw_cache_key).await? {
+                    Some(raw) => raw,
+                    None => {
+                        let digest_ref = Reference::with_digest(
+                            base_ref.registry().to_string(),
+                            base_ref.repository().to_string(),
+                            resolved_manifest_digest_str_temp.clone(),
+                        );
+                        let (raw, _) = oci_client
+                            .pull_manifest_raw(
+                                &digest_ref,
+                                &pull_auth,
+                                &[
+                                    "application/vnd.oci.image.manifest.v1+json",
+                                    "application/vnd.docker.distribution.manifest.v2+json",
+                                ],
+                            )
+                            .await
+                            .map_err(pull_err_mapper)?;
+                        cache.put_blob(&raw_cache_key, &raw).await?;
+                        raw
+                    }
+                };
+                let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw));
+                if actual_digest != resolved_manifest_digest_str_temp {
+                    return Err(Error::ImagePull {
+                        image_ref: base_image_ref_str.clone(),
+                        message: format!("Manifest digest mismatch: expected {resolved_manifest_digest_str_temp}, got {actual_digest}"),
+                        source: None,
+                    });
+                }
+                original_manifest = Some(raw);
+            }
+
             // Fetch config blob using the resolved manifest
             let config_descriptor = &base_image_manifest_resolved.config;
             info!(config_digest = %config_descriptor.digest, "Fetching base image config blob.");
@@ -1413,6 +1567,19 @@ impl ImageBuilder {
             manifest_source = ManifestSource::NotApplicable;
             resolved_manifest_digest_str = String::new();
             default_image_name = "scratch:latest".to_string();
+        }
+
+        if let (Some(base), Some(raw_manifest)) = (&base_image_data, original_manifest) {
+            return write_pulled_archive(
+                base,
+                &raw_manifest,
+                self.output_path,
+                self.output_image_name_and_tag.unwrap_or(default_image_name),
+                BuildDiagnostics {
+                    manifest_source,
+                    resolved_manifest_digest: resolved_manifest_digest_str,
+                },
+            );
         }
 
         let build_artifacts_dir = tempfile::tempdir().map_err(|e| Error::Io {

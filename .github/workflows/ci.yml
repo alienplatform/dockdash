@@ -49,6 +49,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib
+      - run: cargo test --features test-utils --test pull_identity_tests
 
   docs:
     name: Docs

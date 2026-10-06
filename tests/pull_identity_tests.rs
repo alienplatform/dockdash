@@ -7,6 +7,29 @@ use oci_client::{
     Reference,
 };
 use std::{collections::HashMap, fs::File, io::Read};
+#[cfg(unix)]
+use std::{fs, os::unix::fs::PermissionsExt, path::Path};
+
+#[cfg(unix)]
+fn set_cache_writable(path: &Path, writable: bool) {
+    if path.is_dir() {
+        // Restore the directory before its children so writes can resume afterward.
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if writable { 0o755 } else { 0o555 }),
+        )
+        .unwrap();
+        for entry in fs::read_dir(path).unwrap() {
+            set_cache_writable(&entry.unwrap().path(), writable);
+        }
+    } else {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(if writable { 0o644 } else { 0o444 }),
+        )
+        .unwrap();
+    }
+}
 
 fn blobs(image: &Image) -> HashMap<String, Vec<u8>> {
     tar::Archive::new(File::open(image.path()).unwrap())
@@ -71,15 +94,23 @@ async fn repeated_pulls_preserve_registry_manifest_config_and_layers() {
                 .await
                 .unwrap();
         }
-        let (pulled, diagnostics) = Image::builder()
+        #[cfg(unix)]
+        if attempt == 1 {
+            set_cache_writable(directory.path(), false);
+        }
+        let result = Image::builder()
             .from(&reference)
             .platform("linux", &Arch::ARM64)
             .protocol(ClientProtocol::Http)
             .pull_policy(policy)
             .blob_cache(cache.clone())
             .build()
-            .await
-            .unwrap();
+            .await;
+        #[cfg(unix)]
+        if attempt == 1 {
+            set_cache_writable(directory.path(), true);
+        }
+        let (pulled, diagnostics) = result.unwrap();
         assert_eq!(diagnostics.resolved_manifest_digest, digest);
         let archive = blobs(&pulled);
         assert_eq!(

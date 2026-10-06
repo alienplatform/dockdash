@@ -60,12 +60,17 @@ async fn repeated_pulls_preserve_registry_manifest_config_and_layers() {
         .await
         .unwrap();
     let original = blobs(&source);
-    for policy in [PullPolicy::Always, PullPolicy::Always, PullPolicy::Missing] {
-        // A corrupt cached transfer must be replaced with registry bytes.
-        cache
-            .put_blob(&format!("raw-manifest:{digest}"), b"corrupt")
-            .await
-            .unwrap();
+    for (attempt, policy) in [PullPolicy::Always, PullPolicy::Always, PullPolicy::Missing]
+        .into_iter()
+        .enumerate()
+    {
+        // Exercise cold, valid warm, and corrupted transfer caches in that order.
+        if attempt == 2 {
+            cache
+                .put_blob(&format!("raw-manifest:{digest}"), b"corrupt")
+                .await
+                .unwrap();
+        }
         let (pulled, diagnostics) = Image::builder()
             .from(&reference)
             .platform("linux", &Arch::ARM64)

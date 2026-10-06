@@ -1443,12 +1443,12 @@ impl ImageBuilder {
                 // JSON serialization, even of equivalent metadata, changes image identity.
                 let raw_cache_key = format!("raw-manifest:{resolved_manifest_digest_str_temp}");
                 let cached = cache.get_blob(&raw_cache_key).await?;
-                let raw = match cached {
+                let (raw, needs_cache_write) = match cached {
                     Some(raw)
                         if format!("sha256:{:x}", Sha256::digest(&raw))
                             == resolved_manifest_digest_str_temp =>
                     {
-                        raw
+                        (raw, false)
                     }
                     _ => {
                         let digest_ref = Reference::with_digest(
@@ -1467,7 +1467,7 @@ impl ImageBuilder {
                             )
                             .await
                             .map_err(pull_err_mapper)?;
-                        raw
+                        (raw, true)
                     }
                 };
                 let actual_digest = format!("sha256:{:x}", Sha256::digest(&raw));
@@ -1478,7 +1478,9 @@ impl ImageBuilder {
                         source: None,
                     });
                 }
-                cache.put_blob(&raw_cache_key, &raw).await?;
+                if needs_cache_write {
+                    cache.put_blob(&raw_cache_key, &raw).await?;
+                }
                 original_manifest = Some(raw);
             }
 

@@ -78,25 +78,6 @@ impl Layer {
     }
 }
 
-/// Metadata about a file added to the layer, used for input-based cache key calculation.
-#[derive(Debug, Clone)]
-struct FileMetadata {
-    /// Path in the archive
-    archive_path: PathBuf,
-    /// Size of the file
-    size: u64,
-    /// Modification time (seconds since epoch)
-    mtime: u64,
-    /// File mode (permissions)
-    mode: u32,
-    /// Whether this is a directory
-    is_dir: bool,
-    /// Optional content hash for in-memory data (where mtime is meaningless)
-    content_hash: Option<[u8; 32]>,
-    /// Explicit uid/gid; hashed only when set, so entries without an owner keep their key.
-    owner: Option<(u64, u64)>,
-}
-
 /// Builder for creating `Layer` instances.
 ///
 /// Allows for incrementally adding content (directories, files, in-memory data)
@@ -111,8 +92,8 @@ pub struct LayerBuilder {
     uncompressed_tar_path: PathBuf,
     blob_cache: Option<blobcache::BlobCache>,
     created_archive_dirs: HashSet<PathBuf>,
-    /// Metadata about files added to this layer, used for input-based cache key.
-    file_metadata: Vec<FileMetadata>,
+    /// Paths already appended, used to reject conflicting explicit directories.
+    archive_paths: Vec<PathBuf>,
 }
 
 impl LayerBuilder {
@@ -148,7 +129,7 @@ impl LayerBuilder {
             uncompressed_tar_path,
             blob_cache: None,
             created_archive_dirs: HashSet::new(),
-            file_metadata: Vec::new(),
+            archive_paths: Vec::new(),
         })
     }
 
@@ -165,40 +146,7 @@ impl LayerBuilder {
         self
     }
 
-    /// Calculate a cache key from input file metadata.
-    /// This is much faster than hashing the tar content because it only hashes
-    /// the metadata (paths, sizes, mtimes, modes) rather than file contents.
-    /// The key is deterministic: same input files → same tar → same key.
-    fn calculate_input_key(&self) -> String {
-        use sha2::{Digest, Sha256};
-
-        let mut hasher = Sha256::new();
-
-        // Sort metadata by archive path for deterministic ordering
-        let mut sorted_metadata = self.file_metadata.clone();
-        sorted_metadata.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
-
-        for meta in &sorted_metadata {
-            // Hash: path | size | mtime | mode | is_dir | content_hash
-            hasher.update(meta.archive_path.to_string_lossy().as_bytes());
-            hasher.update(meta.size.to_le_bytes());
-            hasher.update(meta.mtime.to_le_bytes());
-            hasher.update(meta.mode.to_le_bytes());
-            hasher.update([meta.is_dir as u8]);
-            if let Some(ref hash) = meta.content_hash {
-                hasher.update(hash);
-            }
-            if let Some((uid, gid)) = meta.owner {
-                hasher.update(uid.to_le_bytes());
-                hasher.update(gid.to_le_bytes());
-            }
-        }
-
-        format!("layer-input-{:x}", hasher.finalize())
-    }
-
     /// Calculate a content-based cache key from a finalized tar file path.
-    /// This is a fallback when input-based caching doesn't produce a hit.
     fn calculate_content_key(tar_path: &Path) -> Result<String> {
         use sha2::{Digest, Sha256};
 
@@ -258,57 +206,18 @@ impl LayerBuilder {
                 }
             })?;
 
-        // Walk the source directory and record metadata for every file,
-        // so the input-based cache key captures actual directory contents.
-        for entry in walkdir::WalkDir::new(dp_ref).sort_by_file_name() {
+        for entry in walkdir::WalkDir::new(dp_ref) {
             let entry = entry.map_err(|e| Error::Io {
                 source: e.into(),
-                message: format!(
-                    "Failed to walk directory {} for cache key metadata",
-                    dp_ref.display()
-                ),
+                message: format!("Failed to walk directory {}", dp_ref.display()),
             })?;
-            let entry_metadata = entry.metadata().map_err(|e| Error::Io {
-                source: e.into(),
-                message: format!("Failed to get metadata for {}", entry.path().display()),
-            })?;
-            let relative = entry.path().strip_prefix(dp_ref).unwrap_or(entry.path());
-            let archive_entry_path = normalized_ap.join(relative);
-
-            let mtime = entry_metadata
-                .modified()
-                .map(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                })
-                .unwrap_or(0);
-
-            let mode = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    entry_metadata.permissions().mode()
-                }
-                #[cfg(not(unix))]
-                {
-                    if entry_metadata.is_dir() {
-                        0o755
-                    } else {
-                        0o644
-                    }
-                }
-            };
-
-            self.file_metadata.push(FileMetadata {
-                archive_path: archive_entry_path,
-                size: entry_metadata.len(),
-                mtime,
-                mode,
-                is_dir: entry_metadata.is_dir(),
-                content_hash: None,
-                owner: None,
-            });
+            let relative = entry
+                .path()
+                .strip_prefix(dp_ref)
+                .map_err(|e| Error::InvalidPath {
+                    message: format!("Directory entry is outside its source: {e}"),
+                })?;
+            self.archive_paths.push(normalized_ap.join(relative));
         }
 
         debug!("Successfully added directory to layer.");
@@ -359,41 +268,13 @@ impl LayerBuilder {
             message: format!("Failed to open file {} for tar", dp_ref.display()),
         })?;
 
-        // Get file metadata for input-based cache key
+        // Preserve source metadata in the tar header
         let file_metadata = f.metadata().map_err(|e| Error::Io {
             source: e,
             message: format!("Failed to get metadata for file {}", dp_ref.display()),
         })?;
 
-        let file_mode = mode.unwrap_or_else(|| {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                file_metadata.permissions().mode()
-            }
-            #[cfg(not(unix))]
-            {
-                0o644
-            }
-        });
-
-        // Track file metadata for input-based cache key calculation
-        self.file_metadata.push(FileMetadata {
-            archive_path: normalized_ap.clone(),
-            size: file_metadata.len(),
-            mtime: file_metadata
-                .modified()
-                .map(|t| {
-                    t.duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                })
-                .unwrap_or(0),
-            mode: file_mode,
-            is_dir: false,
-            content_hash: None,
-            owner: None,
-        });
+        self.archive_paths.push(normalized_ap.clone());
 
         if let Some(new_mode) = mode {
             let mut header = tar::Header::new_gnu();
@@ -490,9 +371,9 @@ impl LayerBuilder {
 
         if self.created_archive_dirs.contains(&normalized_ap)
             || self
-                .file_metadata
+                .archive_paths
                 .iter()
-                .any(|m| m.archive_path.starts_with(&normalized_ap))
+                .any(|path| path.starts_with(&normalized_ap))
         {
             return Err(Error::InvalidPath {
                 message: format!(
@@ -523,15 +404,7 @@ impl LayerBuilder {
             })?;
         self.created_archive_dirs.insert(normalized_ap.clone());
 
-        self.file_metadata.push(FileMetadata {
-            archive_path: normalized_ap,
-            size: 0,
-            mtime: 0,
-            mode,
-            is_dir: true,
-            content_hash: None,
-            owner: Some((uid, gid)),
-        });
+        self.archive_paths.push(normalized_ap);
         Ok(self)
     }
 
@@ -584,22 +457,7 @@ impl LayerBuilder {
                 }
             })?;
 
-        // Hash in-memory content so the input cache key distinguishes
-        // different data at the same path/size (mtime is always 0 here).
-        let content_hash: [u8; 32] = {
-            use sha2::Digest;
-            Sha256::digest(content).into()
-        };
-
-        self.file_metadata.push(FileMetadata {
-            archive_path: normalized_ap,
-            size: content.len() as u64,
-            mtime: 0,
-            mode,
-            is_dir: false,
-            content_hash: Some(content_hash),
-            owner,
-        });
+        self.archive_paths.push(normalized_ap);
 
         debug!("Successfully added data to layer.");
         Ok(self)
@@ -620,54 +478,9 @@ impl LayerBuilder {
             None => blobcache::BlobCache::new()?,
         };
 
-        // Try input-based cache key FIRST (before finalizing tar)
-        // This is much faster than hashing tar content for large binaries
         let compression = self.compression;
-        let input_key = compression.cache_key(self.calculate_input_key());
-        debug!(input_key = %input_key, "Calculated layer input key from file metadata");
-        if let Some(cached_metadata) = cache.get_blob(&input_key).await? {
-            if let Ok(metadata_str) = std::str::from_utf8(&cached_metadata) {
-                if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(metadata_str) {
-                    if let (Some(diff_id), Some(blob_digest)) = (
-                        metadata.get("diff_id").and_then(|v| v.as_str()),
-                        metadata.get("blob_digest").and_then(|v| v.as_str()),
-                    ) {
-                        if let Some(compressed_data) = cache.get_blob(blob_digest).await? {
-                            info!(
-                                input_key = %input_key,
-                                blob_digest = %blob_digest,
-                                "Found layer in cache via input key, skipping tar finalization"
-                            );
-
-                            let compressed_layer_file =
-                                NamedTempFile::new().map_err(|e| Error::Io {
-                                    source: e,
-                                    message: "Failed to create temporary file for cached layer"
-                                        .to_string(),
-                                })?;
-
-                            tokio::fs::write(compressed_layer_file.path(), &compressed_data)
-                                .await
-                                .map_err(|e| Error::Io {
-                                    source: e,
-                                    message: "Failed to write cached layer to temp file"
-                                        .to_string(),
-                                })?;
-
-                            return Ok(Layer {
-                                diff_id: diff_id.to_string(),
-                                blob_digest: blob_digest.to_string(),
-                                media_type: compression.media_type().to_string(),
-                                compressed_layer_file,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Input-based cache miss - finalize the tar and try content-based cache
-        debug!("Input-based cache miss, finalizing tar");
+        // Only the finalized archive captures contents, headers, links, and entry order.
+        // Never read legacy metadata-only keys: equal metadata can hide changed bytes.
 
         // Finalize the tar writer, ensuring all data is flushed and the file is closed.
         let uncompressed_tar_file_writer = self.tar_writer.into_inner().map_err(|e| {
@@ -880,11 +693,6 @@ impl LayerBuilder {
         })?;
         cache.put_blob(&content_key, &metadata_bytes).await?;
         info!(content_key = %content_key, "Stored layer metadata for future cache hits");
-
-        // Also store input-based key mapping for faster future cache lookups
-        // This allows future builds with the same input files to skip tar hashing entirely
-        cache.put_blob(&input_key, &metadata_bytes).await?;
-        info!(input_key = %input_key, "Stored layer metadata with input key for faster cache lookups");
 
         info!(diff_id = %format!("sha256:{}", diff_id_hex), blob_digest = %blob_digest_sha256, "Layer built successfully.");
         Ok(Layer {

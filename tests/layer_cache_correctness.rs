@@ -103,7 +103,7 @@ async fn cache_preserves_archive_entry_order() {
 }
 
 #[tokio::test]
-async fn repeated_content_reuses_compressed_blob() {
+async fn repeated_content_has_stable_compressed_output() {
     for compression in [LayerCompression::Zstd, LayerCompression::Gzip] {
         let root = tempfile::tempdir().unwrap();
         let cache = BlobCache::with_path(root.path().to_path_buf()).unwrap();
